@@ -36,7 +36,8 @@ func IsEIO(err error) bool {
 		return false
 	}
 	errMsg := strings.ToLower(err.Error())
-	return strings.Contains(errMsg, syscall.EIO.Error()) || strings.Contains(errMsg, syscall.EROFS.Error())
+	return strings.Contains(errMsg, syscall.EIO.Error()) || strings.Contains(errMsg, syscall.EROFS.Error()) ||
+		strings.Contains(errMsg, syscall.ENOMEM.Error())
 }
 
 func IsFileExists(filename string) (bool, error) {
@@ -86,6 +87,34 @@ func IsEmptyDisk(filename string) (bool, error) {
 	}
 
 	return true, nil
+}
+
+func IsShardDeleted(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return os.IsNotExist(err) ||
+		err1.Is(err, errors.ErrNoSuchBid) ||
+		errors.DetectCode(err) == errors.CodeBidNotFound
+}
+
+func IsShardMarkDeleted(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return err1.Is(err, errors.ErrShardMarkDeleted) ||
+		errors.DetectCode(err) == errors.CodeShardMarkDeleted
+}
+
+func IsChunkCompacting(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return err1.Is(err, errors.ErrChunkInCompact) ||
+		errors.DetectCode(err) == errors.CodeChunkCompacting
 }
 
 // parse rangeStr to => [start, end]

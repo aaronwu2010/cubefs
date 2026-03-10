@@ -20,6 +20,8 @@ import (
 	syslog "log"
 	"net/http"
 	"net/http/httputil"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"sync"
@@ -235,6 +237,13 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 	m.bindIp = cfg.GetBool(proto.BindIpKey)
 	m.port = cfg.GetString(proto.ListenPort)
 	m.logDir = cfg.GetString(LogDir)
+	// make logDir absolute to avoid dependency on process working directory
+	if m.logDir != "" && !filepath.IsAbs(m.logDir) {
+		if exe, e := os.Executable(); e == nil {
+			base := filepath.Dir(exe)
+			m.logDir = filepath.Join(base, m.logDir)
+		}
+	}
 	m.walDir = cfg.GetString(WalDir)
 	m.bStoreAddr = cfg.GetString(BStoreAddrKey)
 	if m.bStoreAddr == "" {
@@ -438,6 +447,33 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 	m.config.SingleNodeMode = cfg.GetBoolWithDefault(cfgSingleNodeMode, false)
 
 	m.config.MaxWritableDataPartitionCnt = cfg.GetIntWithDefault(cfgMaxWritableDataPartitionCnt, 1000)
+
+	m.config.DataNodeBalanceOn = cfg.GetBoolWithDefault(cfgDataNodeBalanceOn, defaultDataNodeBalanceOn)
+	m.config.DataNodeBalanceInterval = cfg.GetIntWithDefault(cfgDataNodeBalanceInterval, defaultDataNodeBalanceInterval)
+
+	dataNodeDiskUsage := cfg.GetString(cfgDataNodeBalanceByDiskUsageLow)
+	if dataNodeDiskUsage != "" {
+		m.config.DataNodeBalanceByDiskUsageLow, err = strconv.ParseFloat(dataNodeDiskUsage, 64)
+		if err != nil {
+			return fmt.Errorf("config %s:%s, error: %s", cfgDataNodeBalanceByDiskUsageLow, dataNodeDiskUsage, err.Error())
+		}
+	} else {
+		m.config.DataNodeBalanceByDiskUsageLow = defaultDataNodeBalanceByDiskUsageLow
+	}
+
+	dataNodeDiskUsage = cfg.GetString(cfgDataNodeBalanceByDiskUsageHigh)
+	if dataNodeDiskUsage != "" {
+		m.config.DataNodeBalanceByDiskUsageHigh, err = strconv.ParseFloat(dataNodeDiskUsage, 64)
+		if err != nil {
+			return fmt.Errorf("config %s:%s, error: %s", cfgDataNodeBalanceByDiskUsageHigh, dataNodeDiskUsage, err.Error())
+		}
+	} else {
+		m.config.DataNodeBalanceByDiskUsageHigh = defaultDataNodeBalanceByDiskUsageHigh
+	}
+
+	m.config.DataNodeBalanceByDPCountLow = cfg.GetUint32WithDefault(cfgDataNodeBalanceByDPCountLow, defaultDataNodeBalanceByDPCountLow)
+	m.config.DataNodeBalanceByDPCountHigh = cfg.GetUint32WithDefault(cfgDataNodeBalanceByDPCountHigh, defaultDataNodeBalanceByDPCountHigh)
+
 	return
 }
 

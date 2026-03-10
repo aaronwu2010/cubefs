@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
+	"github.com/cubefs/cubefs/util/timeutil"
 )
 
 // used to locate the position in parent
@@ -54,19 +56,19 @@ func NewDirContexts() (dctx *DirContexts) {
 	return
 }
 
-func (dctx *DirContexts) GetCopy(handle fuse.HandleID) DirContext {
+func (dctx *DirContexts) GetCopy(handle fuse.HandleID) (DirContext, bool) {
 	dctx.RLock()
 	if dctx.dirCtx == nil {
 		dctx.RUnlock()
-		return DirContext{}
+		return DirContext{}, false
 	}
 	dirCtx, found := dctx.dirCtx[handle]
 	dctx.RUnlock()
 
 	if found {
-		return DirContext{dirCtx.Name}
+		return DirContext{dirCtx.Name}, true
 	} else {
-		return DirContext{}
+		return DirContext{}, false
 	}
 }
 
@@ -105,6 +107,8 @@ type Dir struct {
 	dctx      *DirContexts
 	parentIno uint64
 	name      string
+	missCount uint32
+	lastTime  int64
 }
 
 // Functions that Dir needs to implement
@@ -161,12 +165,16 @@ func (d *Dir) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error)
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("Release:dir", nil, bgTime, 1)
-		log.LogDebugf("TRACE Release exit: ino(%v) name(%v)", d.info.Inode, d.name)
+		log.LogDebugf("TRACE DirRelease exit: ino(%v) name(%v)", d.info.Inode, d.name)
 	}()
-	// d.dctx.Clear()
-	d.dcache.Clear()
-	ino := d.info.Inode
-	d.super.ic.Delete(ino)
+
+	if !d.super.metaCacheAcceleration {
+		d.dctx.Clear()
+		d.dcache.Clear()
+		ino := d.info.Inode
+		d.super.ic.Delete(ino)
+
+	}
 
 	return nil
 }
@@ -338,9 +346,14 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 		stat.EndStat("Lookup", err, bgTime, 1)
 		d.super.runningMonitor.SubClientOp(runningStat, err)
 	}()
-
+	if d.super.metaCacheAcceleration && (req.Name == ".AppleDouble" || strings.HasPrefix(req.Name, "._")) {
+		err = syscall.ENOENT
+		return nil, ParseError(err)
+	}
 	log.LogDebugf("TRACE Lookup: parent(%v) req(%v)", d.info.Inode, req)
-	log.LogDebugf("TRACE Lookup: parent(%v) path(%v) d.super.bcacheDir(%v)", d.info.Inode, d.getCwd(), d.super.bcacheDir)
+	if log.EnableDebug() {
+		log.LogDebugf("TRACE Lookup: parent(%v) path(%v) d.super.bcacheDir(%v) miss(%v)", d.info.Inode, path.Join(d.getCwd(), req.Name), d.super.bcacheDir, atomic.LoadUint32(&d.missCount))
+	}
 
 	if d.needDentrycache() {
 		dcachev2 = true
@@ -373,6 +386,9 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 	} else {
 		cino, ok := d.dcache.Get(req.Name)
 		if !ok {
+			if log.EnableDebug() {
+				log.LogDebugf("Lookup %v from parent %v miss, try to get from meta", path.Join(d.getCwd(), req.Name), d.info.Inode)
+			}
 			cino, _, err = d.super.mw.Lookup_ll(d.info.Inode, req.Name)
 			if err != nil {
 				if err != syscall.ENOENT {
@@ -384,6 +400,10 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 		ino = cino
 	}
 	var info *proto.InodeInfo
+	missCache := false
+	if d.super.ic.Get(ino) == nil && d.super.metaCacheAcceleration {
+		missCache = true
+	}
 	for {
 		info, err = d.super.InodeGet(ino)
 		if err != nil {
@@ -409,7 +429,25 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 	if mode.IsDir() {
 		d.super.mw.AddInoInfoCache(info.Inode, d.info.Inode, req.Name)
 	}
-	fullPath := path.Join(d.getCwd(), req.Name)
+
+	if missCache && d.super.metaCacheAcceleration {
+		now := timeutil.GetCurrentTime()
+		if atomic.AddUint32(&d.missCount, 1) > 5 && (atomic.LoadInt64(&d.lastTime) == 0 || now.Sub(time.Unix(d.lastTime, 0)) >= 5*time.Minute) {
+			log.LogDebugf("trigger ReadDirAll for missCache %v Nlink %v missCount %v metaCacheAcceleration %v ino(%v) name(%v)",
+				missCache, d.info.Nlink, atomic.LoadUint32(&d.missCount), d.super.metaCacheAcceleration, d.info.Inode, d.getCwd())
+			atomic.StoreInt64(&d.lastTime, now.Unix())
+			atomic.StoreUint32(&d.missCount, 0)
+			meta.GetExtetnsPool.Run(func() {
+				log.LogDebugf("trigger ReadDirAll for ino(%v) name(%v)", d.info.Inode, d.getCwd())
+				auditlog.LogClientOp("TriggerReadDirAllParent", d.getCwd(), "", err, time.Since(*bgTime).Microseconds(), ino, 0)
+				d.ReadDirAll(context.Background())
+			})
+		}
+	}
+	fullPath := req.Name
+	if log.EnableDebug() {
+		fullPath = path.Join(d.getCwd(), req.Name)
+	}
 	d.super.fslock.Lock()
 	child, ok := d.super.nodeCache[ino]
 	if !ok {
@@ -417,8 +455,8 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 			child = NewDir(d.super, info, d.info.Inode, req.Name)
 		} else {
 			child = NewFile(d.super, info, DefaultFlag, d.info.Inode, req.Name)
-			log.LogDebugf("Lookup: new file nodeCache parent(%v) name(%v) ino(%v) storageClass(%v) fullPath(%v)",
-				d.info.Inode, req.Name, ino, child.(*File).info.StorageClass, fullPath)
+			log.LogDebugf("Lookup: new file nodeCache parent(%v) name(%v) ino(%v) storageClass(%v) fullPath(%v), hasExtents(%v)",
+				d.info.Inode, req.Name, ino, child.(*File).info.StorageClass, fullPath, info.HasExtents())
 		}
 		d.super.nodeCache[ino] = child
 	} else {
@@ -431,16 +469,26 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 			if child.(*File).info.StorageClass != info.StorageClass {
 				child = NewFile(d.super, info, DefaultFlag, d.info.Inode, req.Name)
 			}
-			log.LogDebugf("Lookup: update nodeCache parent(%v) name(%v) ino(%v) storageClass(%v)",
-				d.info.Inode, req.Name, ino, child.(*File).info.StorageClass)
+			log.LogDebugf("Lookup: update nodeCache parent(%v) name(%v) ino(%v) storageClass(%v), hasExtents(%v)",
+				d.info.Inode, req.Name, ino, child.(*File).info.StorageClass, info.HasExtents())
 			d.super.nodeCache[ino] = child
 		}
 	}
 	d.super.fslock.Unlock()
+	// maybe some dir never called ReadDir
+	if d.super.metaCacheAcceleration {
+		if d.dcache == nil {
+			d.dcache = NewDentryCache(d.super.metaCacheAcceleration)
+		}
+		if log.EnableDebug() {
+			log.LogDebugf("Lookup store %v  %v to cache ", path.Join(d.getCwd(), req.Name), ino)
+		}
+		d.dcache.Put(req.Name, ino)
+	}
 
 	resp.EntryValid = LookupValidDuration
 
-	log.LogDebugf("TRACE Lookup exit: parent(%v) req(%v) cost (%d)", d.info.Inode, req, time.Since(*bgTime).Microseconds())
+	log.LogDebugf("TRACE Lookup exit: parent(%v) req(%v) cost (%v)", d.info.Inode, req, time.Since(*bgTime).String())
 	return child, nil
 }
 
@@ -462,20 +510,16 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
 		d.super.runningMonitor.SubClientOp(runningStat, err)
 	}()
-	var dirCtx DirContext
-	if req.Offset != 0 {
-		dirCtx = d.dctx.GetCopy(req.Handle)
-	} else {
-		dirCtx = DirContext{}
-	}
+	dirCtx, found := d.dctx.GetCopy(req.Handle)
 	children, err := d.super.mw.ReadDirLimit_ll(d.info.Inode, dirCtx.Name, limit)
 	if err != nil {
 		log.LogErrorf("readdirlimit: Readdir: ino(%v) err(%v) offset %v", d.info.Inode, err, req.Offset)
 		return make([]fuse.Dirent, 0), ParseError(err)
 	}
 
-	if req.Offset == 0 {
+	if dirCtx.Name == "" && !found {
 		if len(children) == 0 {
+			d.dctx.Put(req.Handle, &dirCtx)
 			dirents := make([]fuse.Dirent, 0, len(children))
 			dirents = append(dirents, fuse.Dirent{
 				Inode: d.info.Inode,
@@ -507,6 +551,8 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 	// skip the first one, which is already accessed
 	childrenNr := uint64(len(children))
 	if childrenNr == 0 || (dirCtx.Name != "" && childrenNr == 1) {
+		log.LogDebugf("Readdir no more children: ino(%v) path(%v) d.super.bcacheDir(%v) childrenNr(%v) dirCtx.Name(%v)",
+			d.info.Inode, d.getCwd(), d.super.bcacheDir, childrenNr, dirCtx.Name)
 		return make([]fuse.Dirent, 0), io.EOF
 	} else if childrenNr < limit {
 		err = io.EOF
@@ -525,7 +571,11 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 	log.LogDebugf("Readdir ino(%v) path(%v) d.super.bcacheDir(%v)", d.info.Inode, d.getCwd(), d.super.bcacheDir)
 	var dcache *DentryCache
 	if !d.super.disableDcache {
-		dcache = NewDentryCache()
+		dcache = NewDentryCache(d.super.metaCacheAcceleration)
+	}
+
+	if d.super.metaCacheAcceleration && d.dcache != nil {
+		dcache = d.dcache
 	}
 
 	var dcachev2 bool
@@ -553,7 +603,13 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 		}
 	}
 
-	infos := d.super.mw.BatchInodeGet(inodes)
+	var infos []*proto.InodeInfo
+	if d.super.metaCacheAcceleration {
+		infos = d.super.mw.BatchInodeGetExtents(inodes)
+	} else {
+		infos = d.super.mw.BatchInodeGet(inodes)
+	}
+
 	for _, info := range infos {
 		cacheInfo := d.super.ic.Get(info.Inode)
 		if cacheInfo != nil {
@@ -584,6 +640,7 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	defer func() {
 		stat.EndStat("ReadDirAll", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
+		auditlog.LogClientOp("ReadDirAllComplete", d.getCwd(), "", err, time.Since(*bgTime).Microseconds(), d.info.Inode, 0)
 	}()
 
 	// transform ReadDirAll to ReadDirLimit_ll
@@ -615,7 +672,7 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	log.LogDebugf("Readdir ino(%v) path(%v) d.super.bcacheDir(%v)", d.info.Inode, d.getCwd(), d.super.bcacheDir)
 	var dcache *DentryCache
 	if !d.super.disableDcache {
-		dcache = NewDentryCache()
+		dcache = NewDentryCache(d.super.metaCacheAcceleration)
 	}
 
 	var dcachev2 bool
@@ -643,7 +700,17 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		}
 	}
 
-	infos := d.super.mw.BatchInodeGet(inodes)
+	var infos []*proto.InodeInfo
+	if d.super.metaCacheAcceleration {
+		infos = d.super.mw.BatchInodeGetExtents(inodes)
+	} else {
+		infos = d.super.mw.BatchInodeGet(inodes)
+	}
+
+	maxElements := int(float64(d.super.inodeLruLimit) * 0.8)
+	if len(infos) > maxElements && d.super.metaCacheAcceleration {
+		infos = infos[:maxElements]
+	}
 	for _, info := range infos {
 		d.super.ic.Put(info)
 	}
@@ -689,21 +756,23 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 	defer func() {
 		stat.EndStat("Rename", err, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: d.super.volname})
-		d.super.fslock.Lock()
-		node, ok := d.super.nodeCache[srcInode]
-		if ok && srcInode != 0 {
-			if dir, ok := node.(*Dir); ok {
-				dir.name = req.NewName
-				dir.parentIno = dstDir.info.Inode
-				// log.LogDebugf("TRACE Rename: dir(%v) rename to (%v)", dir.info.Inode, dstPath)
-			} else {
-				file := node.(*File)
-				file.name = req.NewName
-				file.parentIno = dstDir.info.Inode
-				// log.LogDebugf("TRACE Rename: file(%v) rename to (%v)", file.info.Inode, dstPath)
+		if err == nil {
+			d.super.fslock.Lock()
+			node, ok := d.super.nodeCache[srcInode]
+			if ok && srcInode != 0 {
+				if dir, ok := node.(*Dir); ok {
+					dir.name = req.NewName
+					dir.parentIno = dstDir.info.Inode
+					// log.LogDebugf("TRACE Rename: dir(%v) rename to (%v)", dir.info.Inode, dstPath)
+				} else {
+					file := node.(*File)
+					file.name = req.NewName
+					file.parentIno = dstDir.info.Inode
+					// log.LogDebugf("TRACE Rename: file(%v) rename to (%v)", file.info.Inode, dstPath)
+				}
 			}
+			d.super.fslock.Unlock()
 		}
-		d.super.fslock.Unlock()
 		auditlog.LogClientOp("Rename", srcPath, dstPath, err, time.Since(start).Microseconds(), srcInode, dstInode)
 		d.super.runningMonitor.SubClientOp(runningStat, err)
 	}()
@@ -901,6 +970,16 @@ func (d *Dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fus
 		d.super.runningMonitor.SubClientOp(runningStat, err)
 	}()
 
+	// Optimize: directly return empty value for security.capability to avoid frequent server queries
+	// This avoids backend service access for system xattr that is frequently queried during write operations
+	if name == "security.capability" {
+		resp.Xattr = []byte{}
+		if log.EnableDebug() {
+			log.LogDebugf("TRACE GetXattr: ino(%v) name(%v) (optimized, returning empty)", ino, name)
+		}
+		return nil
+	}
+
 	if name == meta.SummaryKey {
 		var summaryInfo meta.SummaryInfo
 		summaryInfo, err = d.super.mw.GetSummary_ll(ino, 20)
@@ -1046,7 +1125,6 @@ func (d *Dir) getCwd() string {
 
 	var pathComponents []string
 	curIno := d.info.Inode
-
 	for curIno != d.super.rootIno {
 		d.super.fslock.Lock()
 		node, ok := d.super.nodeCache[curIno]
@@ -1058,11 +1136,11 @@ func (d *Dir) getCwd() string {
 		}
 
 		curDir, ok := node.(*Dir)
+
 		if !ok {
 			log.LogErrorf("Type error: Cannot convert node to *Dir, ino(%v)", curIno)
 			return "unknown" + buildPath(pathComponents)
 		}
-
 		pathComponents = append(pathComponents, curDir.name)
 		curIno = curDir.parentIno
 	}

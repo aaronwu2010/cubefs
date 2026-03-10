@@ -1067,8 +1067,8 @@ func (ns *nodeSet) startDecommissionSchedule() {
 }
 
 func (ns *nodeSet) stopDecommissionSchedule() {
-	ns.decommissionDataPartitionList.Stop()
 	ns.stopDecommissionDiskSchedule()
+	ns.decommissionDataPartitionList.Stop()
 }
 
 func (ns *nodeSet) dataNodeLen() (count int) {
@@ -1202,6 +1202,25 @@ func (ns *nodeSet) removeAutoDecommissionDisk(dd *DecommissionDisk) {
 	ns.autoDecommissionDiskList.Remove(ns.ID, dd)
 }
 
+func (ns *nodeSet) findRunningDiskAndDecommissionIgnoreDps(c *Cluster) {
+	// try to decommission the dps of running disks that have been ignored in this round of decommissioning
+	allDecommissionRunningDisks := ns.manualDecommissionDiskList.PopDecommissionRunningDisk()
+	if c.AutoDecommissionDiskIsEnabled() {
+		allAutoDecommissionRunningDisks := ns.autoDecommissionDiskList.PopDecommissionRunningDisk()
+		allDecommissionRunningDisks = append(allDecommissionRunningDisks, allAutoDecommissionRunningDisks...)
+	}
+	sort.Slice(allDecommissionRunningDisks, func(i, j int) bool {
+		return allDecommissionRunningDisks[i].DecommissionWeight > allDecommissionRunningDisks[j].DecommissionWeight
+	})
+	log.LogDebugf("ns %v(%p) traverseDecommissionRunningDisk traverse allDecommissionRunningDiskCnt %v",
+		ns.ID, ns, len(allDecommissionRunningDisks))
+	if len(allDecommissionRunningDisks) > 0 {
+		for _, decommissionRunningDisk := range allDecommissionRunningDisks {
+			c.TryDecommissionRunningDiskIgnoreDps(decommissionRunningDisk)
+		}
+	}
+}
+
 func (ns *nodeSet) traverseDecommissionDisk(c *Cluster) {
 	t := time.NewTicker(DecommissionInterval)
 	// wait for loading all decommissionDisk when reload metadata
@@ -1247,6 +1266,8 @@ func (ns *nodeSet) traverseDecommissionDisk(c *Cluster) {
 				}
 				return true
 			})
+
+			ns.findRunningDiskAndDecommissionIgnoreDps(c)
 
 			decommissionDiskCnt, allDecommissionDisks := ns.manualDecommissionDiskList.PopMarkDecommissionDisk(0)
 			if c.AutoDecommissionDiskIsEnabled() {
@@ -2176,7 +2197,7 @@ func (l *DecommissionDataPartitionList) Put(id uint64, value *DataPartition, c *
 	}
 	// prepare status reset to mark status to retry again
 	if value.GetDecommissionStatus() == DecommissionPrepare {
-		value.SetDecommissionStatus(markDecommission)
+		value.SetDecommissionStatus(markDecommission, "leaderChange_updatePrepareToMark", "")
 	}
 	l.mu.Lock()
 	if _, ok := l.cacheMap[value.PartitionID]; ok {
@@ -2202,7 +2223,7 @@ func (l *DecommissionDataPartitionList) Put(id uint64, value *DataPartition, c *
 
 	// restore special replica decommission progress
 	if value.isSpecialReplicaCnt() && value.GetDecommissionStatus() == DecommissionRunning && !value.DecommissionRaftForce {
-		value.SetDecommissionStatus(markDecommission)
+		value.SetDecommissionStatus(markDecommission, "leaderChange_reload_updateRunningToMark", "")
 		value.isRecover = false // can pass decommission validate check
 		log.LogInfof("action[DecommissionDataPartitionListPut] ns[%v]  dp[%v] set status from DecommissionRunning to markDecommission",
 			id, value.PartitionID)
@@ -2301,35 +2322,51 @@ func (l *DecommissionDataPartitionList) startTraverse() {
 
 func updateDecommissionWeight(dps []*DataPartition, c *Cluster) {
 	for _, dp := range dps {
-		if dp.IsDiscard {
-			dp.SetDecommissionStatus(DecommissionSuccess)
-			log.LogWarnf("action[DecommissionListTraverse] skip dp(%v) discard(%v)", dp.PartitionID, dp.IsDiscard)
-			continue
-		}
-		diskErrReplicaNum := dp.getReplicaDiskErrorNum()
-		if diskErrReplicaNum == dp.ReplicaNum || diskErrReplicaNum == uint8(len(dp.Peers)) {
-			log.LogWarnf("action[DecommissionListTraverse] dp[%v] all live replica is unavaliable", dp.decommissionInfo())
-			err := proto.ErrAllReplicaUnavailable
-			dp.DecommissionErrorMessage = err.Error()
-			dp.markRollbackFailed(false)
-			continue
-		}
-		if dp.DecommissionType == AutoDecommission && dp.IsMarkDecommission() {
-			if dp.lostLeader(c) && !dp.DecommissionRaftForce {
-				dp.DecommissionRaftForce = true
-				log.LogWarnf("action[DecommissionListTraverse] change dp[%v] decommission raftForce from false to true", dp.decommissionInfo())
+		if dp.IsMarkDecommission() {
+			vol, err := c.getVol(dp.VolName)
+			if err != nil {
+				log.LogWarnf("action[DecommissionListTraverse] dp[%v] get vol[%v] failed", dp.decommissionInfo(), dp.VolName)
+				dp.DecommissionErrorMessage = err.Error()
+				dp.markRollbackFailed(false, "traverDecommissionList_updateDecommissionWeight_volMarkDeleteCheck", err.Error())
+				continue
 			}
-			diskErrReplicas := dp.getAllDiskErrorReplica()
-			if isReplicasContainsHost(diskErrReplicas, dp.DecommissionSrcAddr) {
-				if dp.ReplicaNum == 3 {
-					if (diskErrReplicaNum == 2 && len(dp.Hosts) == 3) || (diskErrReplicaNum == 1 && len(dp.Hosts) == 2) {
-						dp.DecommissionWeight = highestPriorityDecommissionWeight
-					} else if diskErrReplicaNum == 1 && len(dp.Hosts) == 3 {
-						dp.DecommissionWeight = highPriorityDecommissionWeight
-					}
-				} else if dp.ReplicaNum == 2 {
-					if diskErrReplicaNum == 1 && len(dp.Hosts) == 2 {
-						dp.DecommissionWeight = highPriorityDecommissionWeight
+			if (vol.status() == proto.VolStatusMarkDelete && !vol.Forbidden) ||
+				(vol.status() == proto.VolStatusMarkDelete && vol.Forbidden && time.Until(vol.DeleteExecTime) <= 0) {
+				dp.SetDecommissionStatus(DecommissionSuccess, "traverDecommissionList_updateDecommissionWeight_volMarkDeleteCheck", "")
+				log.LogWarnf("action[DecommissionListTraverse] skip dp(%v) since vol(%v) has been marked for deletion", dp.PartitionID, dp.VolName)
+				continue
+			}
+
+			if dp.IsDiscard {
+				dp.SetDecommissionStatus(DecommissionSuccess, "traverDecommissionList_updateDecommissionWeight_discardCheck", "")
+				log.LogWarnf("action[DecommissionListTraverse] skip dp(%v) discard(%v)", dp.PartitionID, dp.IsDiscard)
+				continue
+			}
+			diskErrReplicaNum := dp.getReplicaDiskErrorNum()
+			if diskErrReplicaNum == dp.ReplicaNum || diskErrReplicaNum == uint8(len(dp.Peers)) {
+				log.LogWarnf("action[DecommissionListTraverse] dp[%v] all live replica is unavailable", dp.decommissionInfo())
+				err := proto.ErrAllReplicaUnavailable
+				dp.DecommissionErrorMessage = err.Error()
+				dp.markRollbackFailed(false, "traverDecommissionList_updateDecommissionWeight_diskErrReplicaNumCheck", err.Error())
+				continue
+			}
+			if dp.DecommissionType == AutoDecommission && dp.IsMarkDecommission() {
+				if dp.lostLeader(c) && !dp.DecommissionRaftForce {
+					dp.DecommissionRaftForce = true
+					log.LogWarnf("action[DecommissionListTraverse] change dp[%v] decommission raftForce from false to true", dp.decommissionInfo())
+				}
+				diskErrReplicas := dp.getAllDiskErrorReplica()
+				if isReplicasContainsHost(diskErrReplicas, dp.DecommissionSrcAddr) {
+					if dp.ReplicaNum == 3 {
+						if (diskErrReplicaNum == 2 && len(dp.Hosts) == 3) || (diskErrReplicaNum == 1 && len(dp.Hosts) == 2) {
+							dp.DecommissionWeight = highestPriorityDecommissionWeight
+						} else if diskErrReplicaNum == 1 && len(dp.Hosts) == 3 {
+							dp.DecommissionWeight = highPriorityDecommissionWeight
+						}
+					} else if dp.ReplicaNum == 2 {
+						if diskErrReplicaNum == 1 && len(dp.Hosts) == 2 {
+							dp.DecommissionWeight = highPriorityDecommissionWeight
+						}
 					}
 				}
 			}
@@ -2341,6 +2378,17 @@ func (l *DecommissionDataPartitionList) handleDpTraverseToReleaseToken(dp *DataP
 	status := dp.GetDecommissionStatus()
 	switch status {
 	case DecommissionSuccess:
+		if dp.DecommissionType == BalanceByDPCount || dp.DecommissionType == BalanceByDiskUsage {
+			if datanode, err := c.dataNode(dp.DecommissionSrcAddr); err != nil {
+				log.LogWarnf("action[DecommissionListTraverse]ns %v(%p) dp[%v] failed to find datanode %v err %v", l.nsId, l, dp.decommissionInfo(), dp.DecommissionSrcAddr, err)
+			} else {
+				// when dp.DecommissionDstNodeSet == 0
+				// the balance of this dp is canceled and will be cleaned afterwards
+				balanceType := dp.DecommissionType
+				dstNodeSet := dp.DecommissionDstNodeSet
+				defer c.postBalanceDecommissionSucccess(balanceType, dp, datanode, dstNodeSet)
+			}
+		}
 		if err := c.setDpRepairingStatus(dp, false); err != nil {
 			log.LogWarnf("action[DecommissionListTraverse]ns %v(%p) dp[%v] set repairStatus to false failed, err %v", l.nsId, l, dp.decommissionInfo(), err)
 		}
@@ -2577,6 +2625,21 @@ func (l *DecommissionDiskList) PopMarkDecommissionDisk(limit int) (count int, co
 		log.LogDebugf("action[PopMarkDecommissionDisk] pop disk[%v]", disk)
 	}
 	return count, collection
+}
+
+func (l *DecommissionDiskList) PopDecommissionRunningDisk() (collection []*DecommissionDisk) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	collection = make([]*DecommissionDisk, 0)
+	for elm := l.decommissionList.Front(); elm != nil; elm = elm.Next() {
+		disk := elm.Value.(*DecommissionDisk)
+		if disk.GetDecommissionStatus() != DecommissionRunning {
+			continue
+		}
+		collection = append(collection, disk)
+		log.LogDebugf("action[PopDecommissionRunningDisk] pop disk[%v]", disk)
+	}
+	return collection
 }
 
 func (l *DecommissionDataPartitionList) Has(id uint64) bool {

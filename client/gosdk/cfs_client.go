@@ -178,8 +178,8 @@ func New(cfg Config) *Client {
 		dirChildrenNumLimit: proto.DefaultDirChildrenNumLimit,
 		cwd:                 "/",
 		sc:                  fs.NewSummaryCache(fs.DefaultSummaryExpiration, fs.MaxSummaryCache),
-		ic:                  fs.NewInodeCache(fs.DefaultInodeExpiration, fs.MaxInodeCache),
-		dc:                  fs.NewDentryCache(),
+		ic:                  fs.NewInodeCache(fs.DefaultInodeExpiration, fs.MaxInodeCache, false),
+		dc:                  fs.NewDentryCache(false),
 	}
 	// Just skip fd 0, 1, 2, to avoid confusion.
 	c.fdset.Set(0).Set(1).Set(2)
@@ -1057,7 +1057,7 @@ func (c *Client) write(f *File, offset int64, data []byte, flags int) (n int, er
 			}
 			return nil
 		}
-		n, err = c.ec.Write(f.ino, int(offset), data, flags, checkFunc, f.storageClass, false)
+		n, err = c.ec.Write(f.ino, int(offset), data, flags, checkFunc, f.storageClass, false, false)
 	} else {
 		n, err = f.fileWriter.Write(c.ctx(c.ID, f.ino), int(offset), data, flags)
 	}

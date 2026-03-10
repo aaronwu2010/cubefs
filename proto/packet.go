@@ -295,14 +295,19 @@ const (
 	OpWriteOpOfProtoVerForbidden        uint8 = 0x88
 	OpMetaForbiddenMigration            uint8 = 0x89
 	// Distributed cache related OP codes.
-	OpFlashNodeHeartbeat        uint8 = 0xDA
-	OpFlashNodeCachePrepare     uint8 = 0xDB
-	OpFlashNodeCacheRead        uint8 = 0xDC
-	OpFlashNodeSetReadIOLimits  uint8 = 0xED
-	OpFlashNodeSetWriteIOLimits uint8 = 0xEE
-	OpFlashNodeScan             uint8 = 0xD4
-	OpFlashNodeTaskCommand      uint8 = 0xD5
+	OpFlashNodeHeartbeat        uint8 = 0xC1
+	OpFlashNodeCachePrepare     uint8 = 0xC2
+	OpFlashNodeCacheRead        uint8 = 0xC3
+	OpFlashNodeCachePutBlock    uint8 = 0xC4
+	OpFlashNodeCacheDelete      uint8 = 0xC5
+	OpFlashNodeCacheReadObject  uint8 = 0xC6
+	OpFlashNodeSetReadIOLimits  uint8 = 0xC7
+	OpFlashNodeSetWriteIOLimits uint8 = 0xC8
+	OpFlashNodeScan             uint8 = 0xC9
+	OpFlashNodeTaskCommand      uint8 = 0xCA
 	OpFlashSDKHeartbeat         uint8 = 0xCB
+	OpFlashNodeBatchReadObject  uint8 = 0xCC
+	OpApplyWarmupMetaToken      uint8 = 0xCD
 )
 
 const (
@@ -319,13 +324,13 @@ const (
 	PacketProtocolVersionFlag                 = 0x10
 
 	DefaultRemoteCacheTTL               = 5 * 24 * 3600
-	DefaultRemoteCacheClientReadTimeout = 100 // ms
+	DefaultRemoteCacheClientReadTimeout = 2000 // ms
 	DefaultRemoteCacheMaxFileSizeGB     = 128
 	DefaultFlashNodeTimeoutCount        = 5
 	DefaultRemoteCacheHandleReadTimeout = 100 // ms
 	DefaultRemoteCacheExtentReadTimeout = 3000
 	DefaultRemoteCacheSameZoneTimeout   = 400 // microsecond
-	DefaultRemoteCacheSameRegionTimeout = 2   // ms
+	DefaultRemoteCacheSameRegionTimeout = 100 // ms
 )
 
 // multi version operation
@@ -753,6 +758,16 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpIsRaftStatusOk"
 	case OpFlashSDKHeartbeat:
 		m = "OpFlashSDKHeartbeat"
+	case OpFlashNodeCachePutBlock:
+		m = "OpFlashNodeCachePutBlock"
+	case OpFlashNodeCacheDelete:
+		m = "OpFlashNodeCacheDelete"
+	case OpFlashNodeCacheReadObject:
+		m = "OpFlashNodeCacheReadObject"
+	case OpFlashNodeBatchReadObject:
+		m = "OpFlashNodeBatchReadObject"
+	case OpApplyWarmupMetaToken:
+		m = "OpApplyWarmupMetaToken"
 	default:
 		m = fmt.Sprintf("op:%v not found", p.Opcode)
 	}
@@ -1087,6 +1102,40 @@ func (p *Packet) WriteToConn(c net.Conn) (err error) {
 		if _, err = c.Write(p.Arg[:int(p.ArgLen)]); err == nil {
 			if p.Data != nil && p.Size != 0 {
 				_, err = c.Write(p.Data[:p.Size])
+			}
+		}
+	}
+
+	return
+}
+
+func (p *Packet) WriteToConnForOCS(c net.Conn, readDiskSize uint32) (err error) {
+	headSize := p.CalcPacketHeaderSize()
+	header, err := Buffers.Get(headSize)
+	if err != nil {
+		header = make([]byte, headSize)
+	}
+	// log.LogErrorf("action[WriteToConn] buffer get nil,opcode %v head len [%v]", p.Opcode, len(header))
+	defer Buffers.Put(header)
+	c.SetWriteDeadline(time.Now().Add(WriteDeadlineTime * time.Second))
+	p.MarshalHeader(header)
+	if _, err = c.Write(header); err == nil {
+		// write dir version info.
+		if p.IsVersionList() {
+			d, err1 := p.MarshalVersionSlice()
+			if err1 != nil {
+				log.LogErrorf("MarshalVersionSlice: marshal version ifo failed, err %s", err1.Error())
+				return err1
+			}
+
+			_, err = c.Write(d)
+			if err != nil {
+				return err
+			}
+		}
+		if _, err = c.Write(p.Arg[:int(p.ArgLen)]); err == nil {
+			if p.Data != nil && p.Size != 0 {
+				_, err = c.Write(p.Data[:readDiskSize])
 			}
 		}
 	}
@@ -1460,11 +1509,11 @@ func (p *Packet) IsForwardPkt() bool {
 // LogMessage logs the given message.
 func (p *Packet) LogMessage(action, remote string, start int64, err error) (m string) {
 	if err == nil {
-		m = fmt.Sprintf("id[%v] isPrimaryBackReplLeader[%v] remote[%v] "+
-			" cost[%v] ", p.GetUniqueLogId(), p.IsForwardPkt(), remote, (time.Now().UnixNano()-start)/1e6)
+		m = fmt.Sprintf("id[%v] action[%v] isPrimaryBackReplLeader[%v] remote[%v] "+
+			" cost[%v] ", p.GetUniqueLogId(), action, p.IsForwardPkt(), remote, (time.Now().UnixNano()-start)/1e6)
 	} else {
-		m = fmt.Sprintf("id[%v] isPrimaryBackReplLeader[%v] remote[%v]"+
-			", err[%v]", p.GetUniqueLogId(), p.IsForwardPkt(), remote, err.Error())
+		m = fmt.Sprintf("id[%v] action[%v] isPrimaryBackReplLeader[%v] remote[%v]"+
+			", err[%v]", p.GetUniqueLogId(), action, p.IsForwardPkt(), remote, err.Error())
 	}
 	return
 }

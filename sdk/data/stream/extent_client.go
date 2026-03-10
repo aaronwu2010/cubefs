@@ -163,10 +163,13 @@ type ExtentConfig struct {
 	AheadReadTotalMem     int64
 	AheadReadBlockTimeOut int
 	AheadReadWindowCnt    int
+	MinReadAheadSize      int
 	// remoteCache
 	NeedRemoteCache  bool
 	ForceRemoteCache bool
 	HeartBeatPing    bool
+	EnableAsyncFlush bool
+	MetaAcceleration bool
 }
 
 type MultiVerMgr struct {
@@ -220,6 +223,8 @@ type ExtentClient struct {
 	wg           sync.WaitGroup
 
 	forceRemoteCache bool
+	enableAsyncFlush bool
+	metaAcceleration bool
 }
 
 func (client *ExtentClient) UidIsLimited(uid uint32) bool {
@@ -352,6 +357,8 @@ retry:
 	client.forbiddenMigration = config.OnForbiddenMigration
 	client.getInodeInfo = config.OnGetInodeInfo
 	client.forceRemoteCache = config.ForceRemoteCache
+	client.enableAsyncFlush = config.EnableAsyncFlush
+	client.metaAcceleration = config.MetaAcceleration
 
 	if config.StreamRetryTimeout <= 0 || config.StreamRetryTimeout >= 600 {
 		client.streamRetryTimeout = StreamSendMaxTimeout
@@ -402,7 +409,6 @@ retry:
 	}
 	client.extentConfig = config
 	if config.NeedRemoteCache {
-		client.RemoteCache.HeartBeatPing = config.HeartBeatPing
 		client.RemoteCache.Init(client)
 	} else {
 		log.LogInfof("NewExtentClient for (%v) not init remoteCache, config.NeedRemoteCache %v", client.volumeName,
@@ -434,16 +440,9 @@ func (client *ExtentClient) SetClientID(id uint64) (err error) {
 }
 
 func (client *ExtentClient) IsRemoteCacheEnabled() bool {
-	rcEnable := client.RemoteCache.ClusterEnabled && client.RemoteCache.VolumeEnabled
+	rcEnable := client.RemoteCache.Started && client.RemoteCache.remoteCacheClient != nil && client.RemoteCache.remoteCacheClient.IsClusterEnable() && (client.forceRemoteCache || client.RemoteCache.VolumeEnabled)
 	master.ClientRCacheEnable = rcEnable
 	return rcEnable
-}
-
-func (client *ExtentClient) enableRemoteCacheCluster(enabled bool) {
-	if client.RemoteCache.ClusterEnabled != enabled {
-		log.LogInfof("enableRemoteCacheCluster: %v -> %v", client.RemoteCache.ClusterEnabled, enabled)
-		client.RemoteCache.ClusterEnabled = enabled
-	}
 }
 
 func (client *ExtentClient) UpdateRemoteCacheConfig(view *proto.SimpleVolView) {
@@ -514,6 +513,7 @@ func (client *ExtentClient) OpenStream(inode uint64, openForWrite, isCache bool,
 	if !ok {
 		s = NewStreamer(client, inode, openForWrite, isCache, fullPath)
 		client.streamers[inode] = s
+		log.LogDebugf("action[OpenStream] create new streamer for ino(%v) %p", inode, s)
 	} else {
 		// If you open a file in write mode first and then open the same file
 		// in read mode without modifying any attributes, maintaining the file's immutability status.
@@ -521,6 +521,11 @@ func (client *ExtentClient) OpenStream(inode uint64, openForWrite, isCache bool,
 			s.openForWrite = openForWrite
 		}
 		// TODO: update isCache?
+		log.LogDebugf("action[OpenStream] reuse  streamer for ino(%v)%p", inode, s)
+		// update rightOffset to make window for aheadRead move forward
+		if s.aheadReadWindow != nil {
+			s.aheadReadWindow.rightOffset = 0
+		}
 	}
 	return s.IssueOpenRequest()
 }
@@ -559,6 +564,10 @@ func (client *ExtentClient) OpenStreamWithCache(inode uint64, needBCache, openFo
 		if !client.disableMetaCache && needBCache {
 			client.streamerList.PushFront(inode)
 		}
+	} else {
+		if s.aheadReadWindow != nil {
+			s.aheadReadWindow.rightOffset = 0
+		}
 	}
 	s.needBCache = needBCache
 	if !s.isOpen && !client.disableMetaCache {
@@ -568,6 +577,7 @@ func (client *ExtentClient) OpenStreamWithCache(inode uint64, needBCache, openFo
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
 		go s.asyncBlockCache()
+		go s.asyncFlushManager()
 	}
 	return s.IssueOpenRequest()
 }
@@ -631,6 +641,15 @@ func (client *ExtentClient) EvictStream(inode uint64) error {
 	return nil
 }
 
+func (client *ExtentClient) RefreshExtentsWithCache(inode *proto.InodeInfo) error {
+	s := client.GetStreamer(inode.Inode)
+	if s == nil {
+		return nil
+	}
+	s.extents.update(inode.Extents.Generation, inode.Extents.Size, false, inode.Extents.Extents)
+	return nil
+}
+
 // RefreshExtentsCache refreshes the extent cache.
 func (client *ExtentClient) RefreshExtentsCache(inode uint64) error {
 	s := client.GetStreamer(inode)
@@ -690,7 +709,9 @@ func (client *ExtentClient) SetFileSize(inode uint64, size int, sync bool) {
 }
 
 // Write writes the data.
-func (client *ExtentClient) Write(inode uint64, offset int, data []byte, flags int, checkFunc func() error, storageClass uint32, isMigration bool) (write int, err error) {
+func (client *ExtentClient) Write(inode uint64, offset int, data []byte, flags int, checkFunc func() error,
+	storageClass uint32, isMigration, waitForFlush bool,
+) (write int, err error) {
 	prefix := fmt.Sprintf("Write{ino(%v)offset(%v)size(%v)}", inode, offset, len(data))
 	s := client.GetStreamer(inode)
 	if s == nil {
@@ -708,7 +729,7 @@ func (client *ExtentClient) Write(inode uint64, offset int, data []byte, flags i
 		// TODO unhandled error
 		s.GetExtents(isMigration)
 	})
-
+	s.waitForFlush = waitForFlush
 	write, err = s.IssueWriteRequest(offset, data, flags, checkFunc, storageClass, isMigration)
 	if err != nil {
 		log.LogError(errors.Stack(err))
@@ -763,10 +784,16 @@ func (client *ExtentClient) Read(inode uint64, data []byte, offset int, size int
 
 	var errGetExtents error
 	s.once.Do(func() {
-		errGetExtents = s.GetExtents(isMigration)
+		if s.extents.gen == 0 {
+			errGetExtents = s.GetExtents(isMigration)
+		} else {
+			errGetExtents = nil
+		}
+		// errGetExtents = s.GetExtents(isMigration)
 		if log.EnableDebug() {
-			log.LogDebugf("Read: ino(%v) offset(%v) size(%v) storageClass(%v) isMigration(%v) errGetExtents(%v)",
-				inode, offset, size, storageClass, isMigration, errGetExtents)
+			log.LogDebugf("Read: ino(%v) offset(%v) size(%v) storageClass(%v) isMigration(%v) errGetExtents(%v) "+
+				"rdonly(%v) dirty(%v)",
+				inode, offset, size, storageClass, isMigration, errGetExtents, s.rdonly, s.dirty)
 		}
 	})
 	if errGetExtents != nil {
@@ -774,7 +801,9 @@ func (client *ExtentClient) Read(inode uint64, data []byte, offset int, size int
 		log.LogErrorf("Read: ino(%v) offset(%v) size(%v): %v", inode, offset, size, err)
 		return 0, err
 	}
-
+	log.LogDebugf("Read: ino(%v) offset(%v) size(%v) storageClass(%v) isMigration(%v) errGetExtents(%v) "+
+		"rdonly(%v) dirty(%v) waitForFlush(%v)",
+		inode, offset, size, storageClass, isMigration, errGetExtents, s.rdonly, s.dirty, s.waitForFlush)
 	if !s.rdonly || s.dirty {
 		err = s.IssueFlushRequest()
 		if err != nil {
@@ -875,6 +904,11 @@ func (client *ExtentClient) GetStreamer(inode uint64) *Streamer {
 		s.pendingCache = make(chan bcacheKey, 1)
 		go s.server()
 		go s.asyncBlockCache()
+		go s.asyncFlushManager()
+
+		if client.AheadRead != nil && s.aheadReadWindow != nil {
+			go s.aheadReadWindow.backgroundAheadReadTask()
+		}
 	}
 	return s
 }
@@ -927,6 +961,9 @@ func (client *ExtentClient) Close() error {
 		_ = client.EvictStream(inode)
 	}
 	client.dataWrapper.Stop()
+	if client.RemoteCache.Started {
+		client.RemoteCache.Stop()
+	}
 	return nil
 }
 
@@ -974,6 +1011,10 @@ func (c *ExtentClient) servePrepareRequest(prepareReq *PrepareRemoteCacheRequest
 	}
 	if prepareReq.warmUp {
 		s.prepareRemoteCache(prepareReq.ctx, prepareReq.ek, prepareReq.gen)
+		if prepareReq.triggerClean {
+			s.client.CloseStream(prepareReq.inode)
+			s.client.EvictStream(prepareReq.inode)
+		}
 	} else {
 		inodeInfo, err := s.client.getInodeInfo(prepareReq.inode)
 		if err != nil {

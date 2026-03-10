@@ -83,11 +83,23 @@ const (
 	AheadReadTotalMemGB
 	AheadReadBlockTimeOut
 	AheadReadWindowCnt
+	// min read ahead size
+	MinReadAheadSize
 	ReqChanCnt
-
 	// remotecache
 	ForceRemoteCache
+	DebugCluster
+	EnableAsyncFlush
 
+	// warm up
+	ReadDirLimit
+	MaxWarmUpConcurrency
+	StopWarmMeta
+	TcpAliveTime
+	MetaCacheAcceleration
+	MinimumNlinkReadDir
+	InodeLruLimit
+	FuseServeThreads
 	MaxMountOption
 )
 
@@ -175,7 +187,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[EnableAudit] = MountOption{"enableAudit", "enable client audit logging", "", true}
 	opts[RequestTimeout] = MountOption{"requestTimeout", "The Request Expiration Time", "", int64(0)}
 	opts[ClientOpTimeOut] = MountOption{"clientOpTimeOut", "client op time out in seconds", "", int64(300)}
-
+	opts[TcpAliveTime] = MountOption{"tcpAliveTime", "tcp alive time in seconds", "", int64(0)}
 	opts[FileSystemName] = MountOption{"fileSystemName", "The explicit name of the filesystem", "", ""}
 	opts[SnapshotReadVerSeq] = MountOption{"snapshotReadSeq", "Snapshot read seq", "", int64(0)} // default false
 	opts[DisableMountSubtype] = MountOption{"disableMountSubtype", "Disable Mount Subtype", "", false}
@@ -186,8 +198,17 @@ func InitMountOptions(opts []MountOption) {
 	opts[AheadReadTotalMemGB] = MountOption{"aheadReadTotalMemGB", "ahead read total mem(GB)", "", int64(10)}
 	opts[AheadReadBlockTimeOut] = MountOption{"aheadReadBlockTimeOut", "ahead read block expiration time", "", int64(3)}
 	opts[AheadReadWindowCnt] = MountOption{"aheadReadWindowCnt", "ahead read window block count", "", int64(8)}
-
+	opts[MinReadAheadSize] = MountOption{"minReadAheadSize", "minimum file size to trigger ahead read (bytes)", "", int64(10485760)} // default 10MB
 	opts[ForceRemoteCache] = MountOption{"forceRemoteCache", "All read requests are handled by the remote cache.", "", false}
+	opts[DebugCluster] = MountOption{"debugCluster", "display cluster name", "", ""}
+	opts[EnableAsyncFlush] = MountOption{"enableAsyncFlush", "async flush extent handler", "", true}
+	opts[ReadDirLimit] = MountOption{"readDirLimit", "The limit for reading directory entries in warm up", "", int64(500)}
+	opts[MaxWarmUpConcurrency] = MountOption{"maxWarmUpConcurrency", "The maximum number of concurrent goroutines for warm up", "", int64(2)}
+	opts[StopWarmMeta] = MountOption{"stopWarmMeta", "Stop warm up meta", "", true}
+	opts[MetaCacheAcceleration] = MountOption{"metaCacheAcceleration", "keep meta cache and get inode/extents in one go", "", false}
+	opts[MinimumNlinkReadDir] = MountOption{"minimumNlinkReadDir", "the minimum Nlink value of the directory that actively triggers the ReadDir operation", "", int64(10000)}
+	opts[InodeLruLimit] = MountOption{"inodeLruLimit", "capacity for inode lru", "", int64(2000000)}
+	opts[FuseServeThreads] = MountOption{"fuseServeThreads", "Fuse Serve Threads", "", int64(0)}
 	for i := 0; i < MaxMountOption; i++ {
 		flag.StringVar(&opts[i].cmdlineValue, opts[i].keyword, "", opts[i].description)
 	}
@@ -346,6 +367,7 @@ type MountOptions struct {
 	EnableAudit             bool
 	RequestTimeout          int64
 	ClientOpTimeOut         int64
+	TcpAliveTime            int64
 	FileSystemName          string
 	// TrashInterval                       int64
 	TrashDeleteExpiredDirGoroutineLimit int64
@@ -368,4 +390,15 @@ type MountOptions struct {
 
 	// remote cache
 	ForceRemoteCache bool
+	EnableAsyncFlush bool
+
+	// warm up
+	ReadDirLimit          int64
+	MaxWarmUpConcurrency  int64
+	StopWarmMeta          bool
+	MetaCacheAcceleration bool
+	MinimumNlinkReadDir   int64
+	InodeLruLimit         int64
+	FuseServeThreads      int64
+	MinReadAheadSize      int64
 }

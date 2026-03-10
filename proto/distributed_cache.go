@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"strings"
@@ -12,11 +13,17 @@ import (
 
 const (
 	PageSize                = 4 * 1024
+	CACHE_BLOCK_PACKET_SIZE = 128 * PageSize
+	CACHE_WRITE_CHUCK_SIZE  = 64 * 1024
 	CACHE_BLOCK_SIZE        = 1 << 20
+	CACHE_OBJECT_BLOCK_SIZE = 4 * 1024 * 1024
+	SMALL_OBJECT_BLOCK_SIZE = 16 * 1024
 	ReadCacheTimeout        = 1 // second
 	DefaultCacheTTLSec      = 5 * 24 * 3600
 	FlashGroupDefaultWeight = 1
 	FlashGroupMaxWeight     = 30
+	CACHE_BLOCK_CRC_SIZE    = 4
+	WarnMagicNumber         = 0x57 // 'W' for WarmUp
 )
 
 const (
@@ -34,6 +41,60 @@ const (
 	FlashManualWarmupAction = "warmup"
 	FlashManualClearAction  = "clear"
 	FlashManualCheckAction  = "check"
+)
+
+var (
+	ErrorNotExistShouldCache        = fmt.Errorf("cache miss: should store and cache the key")
+	ErrorNotExistShouldNotCache     = fmt.Errorf("only cache the miss after reaching the miss times")
+	ErrorUnableToBuildKeyFromPacket = fmt.Errorf("unable to build a key from the packet due to lack of available parameters")
+	ErrorParsingCacheWriteHead      = fmt.Errorf("error parsing cache write head structure")
+	ErrorNoCacheDeleteRequest       = fmt.Errorf("no cache delete request")
+	ErrorNoCacheReadRequest         = fmt.Errorf("no cache read request")
+	ErrorNoCachePrepareRequest      = fmt.Errorf("no cache prepare request")
+	ErrorDeleteBlockKeyNil          = fmt.Errorf("delete block key is nil")
+	ErrorRequireDataIsCaching       = fmt.Errorf("require data is caching")
+	ErrorReadTimeout                = fmt.Errorf("read timeout")
+	ErrorNoAvailableHost            = fmt.Errorf("no available host")
+	ErrorContextDeadLine            = fmt.Errorf("context deadline exceeded")
+	ErrorRequestOutOfRange          = fmt.Errorf("the requested read size is out of range")
+	ErrorUnableGetCreatedBlock      = fmt.Errorf("unable to get created cacheblock")
+	ErrorNoFlashGroup               = fmt.Errorf("cannot find any flashGroups")
+	ErrorInitRemoteTimeout          = fmt.Errorf("init remote cache timeout for remote client")
+)
+
+var (
+	ErrorResultCodeNOKTpl              = "ResultCode NOK (%v)"
+	ErrorUnknownOpcodeTpl              = "unknown Opcode:%d"
+	ErrorTaskIDNotExistTpl             = "task id(%v) not exist"
+	ErrorBlockAlreadyExistsTpl         = "block %v already exist expireTime(%v)"
+	ErrorCreateBlockFailedTpl          = "create block(%v) error %v"
+	ErrorBlockAlreadyCreatedTpl        = "block(%v) already created expireTime(%v)"
+	ErrorPutDataLengthInvalidTpl       = "put data length %v is leq 0 or gt 4M"
+	ErrorInconsistentCRCTpl            = "inconsistent CRC, expect(%v) reply(%v)"
+	ErrorExpectedReadBytesMismatchTpl  = "expected to read %d bytes, but only read %d"
+	ErrorUnexpectedDataLengthTpl       = "unexpected data length: expected %d bytes, got %d"
+	ErrorWriteDataAndCRCToFlashNodeTpl = "write data and crc to flashNode get err %v"
+	ErrorReadFromCloseReaderTpl        = "read from close reader reqID(%v)"
+	ErrorInconsistentCRCObjectTpl      = "inconsistent CRC, offset(%v) extentOffset(%v) expect(%v) actualCrc(%v)"
+	ErrorInvalidRangeTpl               = "invalid range: from(%v) to(%v)"
+	ErrorContextErrorTpl               = "context error: %v"
+	ErrorRemoteErrorTpl                = "remote error: %v"
+	ErrorReadErrorTpl                  = "read error: %v"
+	ErrorIOErrorTpl                    = "io error: %v"
+	ErrorFlowLimitErrorTpl             = "flow limit error: %v"
+)
+
+const (
+	WarmStatusInitializing = 1
+	WarmStatusRunning      = 2
+	WarmStatusCompleted    = 3
+	WarmStatusFailed       = 4
+)
+
+const (
+	WarmupMetaTokenApply   = 1 // apply for warmup meta token
+	WarmupMetaTokenRenew   = 2 // renew warmup meta token
+	WarmupMetaTokenRelease = 3 // release warmup meta token
 )
 
 type FlashGroupStatus int
@@ -86,6 +147,13 @@ type FlashGroupInfo struct {
 type FlashGroupView struct {
 	Enable      bool
 	FlashGroups []*FlashGroupInfo
+}
+
+type CoonHandler struct {
+	RemoteError       error
+	Completed         chan struct{}
+	WaitAckChanClosed bool
+	WaitAckChan       chan struct{}
 }
 
 func (f *FlashGroupInfo) String() string {
@@ -247,20 +315,106 @@ func (pr *CachePrepareRequest) String() string {
 	return fmt.Sprintf("cachePrepareRequest[Volume(%v) Inode(%v) FixedFileOffset(%v) Sources(%v) TTL(%v)]", pr.CacheRequest.Volume, pr.CacheRequest.Inode, pr.CacheRequest.FixedFileOffset, len(pr.CacheRequest.Sources), pr.CacheRequest.TTL)
 }
 
+func (pbh *PutBlockHead) String() string {
+	if pbh == nil {
+		return ""
+	}
+	return fmt.Sprintf("PutBlockHead[UniKey(%v) BlockLen(%v) TTL(%v)]", pbh.UniKey, pbh.BlockLen, pbh.TTL)
+}
+
+func (m *BatchReadItem) String() string {
+	if m == nil {
+		return "BatchReadItem(nil)"
+	}
+	return fmt.Sprintf("BatchReadItem[Key(%s) Offset(%d) Size(%d) Slot(%d) ReqId(%d) Tid(%s)]",
+		m.Key, m.Offset, m.Size_, m.Slot, m.ReqId, m.Tid)
+}
+
+func (m *BatchReadReq) String() string {
+	if m == nil {
+		return "BatchReadReq(nil)"
+	}
+	return fmt.Sprintf("BatchReadReq[Deadline(%d) len(%d)]",
+		m.Deadline, len(m.Items))
+}
+
+func (m *ReadResult) String() string {
+	if m == nil {
+		return "ReadResult(nil)"
+	}
+	dataLen := 0
+	if m.Data != nil {
+		dataLen = len(m.Data)
+	}
+	return fmt.Sprintf("ReadResult[ReqId(%d) ResultCode(%d) CRC(%d) DataLen(%d)]",
+		m.ReqId, m.ResultCode, m.CRC, dataLen)
+}
+
+func (m *BatchReadResp) String() string {
+	if m == nil {
+		return "BatchReadResp(nil)"
+	}
+	return fmt.Sprintf("BatchReadResp[%d]", len(m.Results))
+}
+
+func (cr *CacheReadRequestBase) DecodeBinaryFrom(b []byte) {
+	keyLen := binary.BigEndian.Uint16(b[:2])
+	cr.Key = string(b[2 : 2+keyLen])
+	off := 2 + uint32(keyLen)
+	cr.TTL = int64(binary.BigEndian.Uint64(b[off : off+8])) // TTL (uint64, 8 bytes)
+	off += 8
+	cr.Slot = binary.BigEndian.Uint64(b[off : off+8]) // Slot (uint64, 8 bytes)
+	off += 8
+	cr.Offset = binary.BigEndian.Uint64(b[off : off+8]) // Offset  (uint64, 8 bytes)
+	off += 8
+	cr.Size_ = binary.BigEndian.Uint64(b[off : off+8]) // Size (uint64, 8 bytes)
+	off += 8
+	cr.Deadline = binary.BigEndian.Uint64(b[off : off+8]) // Deadline (uint64, 8 bytes)
+}
+
+func (cr *CacheReadRequestBase) EncodeBinaryTo(b []byte) {
+	binary.BigEndian.PutUint16(b[:2], uint16(len(cr.Key))) // Length of Key (uint16, 2bytes)
+	copy(b[2:2+len(cr.Key)], cr.Key)                       // Key
+	off := 2 + len(cr.Key)
+	binary.BigEndian.PutUint64(b[off:off+8], uint64(cr.TTL)) // TTL (uint64, 8 bytes)
+	off += 8
+	binary.BigEndian.PutUint64(b[off:off+8], cr.Slot) // Slot (uint64, 8 bytes)
+	off += 8
+	binary.BigEndian.PutUint64(b[off:off+8], cr.Offset) // Offset  (uint64, 8 bytes)
+	off += 8
+	binary.BigEndian.PutUint64(b[off:off+8], cr.Size_) // Size (uint64, 8 bytes)
+	off += 8
+	binary.BigEndian.PutUint64(b[off:off+8], cr.Deadline) // Deadline (uint64, 8 bytes)
+}
+
+func (cr *CacheReadRequestBase) EncodeBinaryLen() int {
+	return 2 + len(cr.Key) + 8 + 8 + 8 + 8 + 8
+}
+
+func (cr *CacheReadRequestBase) String() string {
+	if cr == nil {
+		return ""
+	}
+	return fmt.Sprintf("cacheReadRequestBase[Key(%v) TTL(%v) Slot(%v) Offset(%v) Size(%v) Deadline(%v)]",
+		cr.Key, cr.TTL, cr.Slot, cr.Offset, cr.Size_, cr.Deadline)
+}
+
 type FlashGroupsAdminView struct {
 	FlashGroups []FlashGroupAdminView
 }
 
 type FlashGroupAdminView struct {
-	ID             uint64
-	Slots          []uint32
-	Weight         uint32
-	Status         FlashGroupStatus
-	SlotStatus     SlotStatus
-	PendingSlots   []uint32
-	Step           uint32
-	FlashNodeCount int
-	ZoneFlashNodes map[string][]*FlashNodeViewInfo
+	ID              uint64
+	Slots           []uint32
+	ReservedSlots   []uint32
+	IsReducingSlots bool
+	Weight          uint32
+	Status          FlashGroupStatus
+	SlotStatus      SlotStatus
+	PendingSlots    []uint32
+	Step            uint32
+	FlashNodeCount  int
+	ZoneFlashNodes  map[string][]*FlashNodeViewInfo
 }
 
 type FlashNodeViewInfo struct {
@@ -281,6 +435,14 @@ type FlashNodeStat struct {
 	NodeLimit         uint64
 	VolLimit          map[string]uint64
 	CacheStatus       []*CacheStatus
+}
+
+type FlashWriteParam struct {
+	Offset   int64
+	Size     int64
+	Data     []byte
+	Crc      []byte
+	DataSize int64
 }
 
 type CacheStatus struct {
@@ -310,6 +472,23 @@ type FlashNodeSlotStat struct {
 	NodeId   uint64
 	Addr     string
 	SlotStat []*SlotStat
+}
+
+type RemoteCacheConfig struct {
+	FlashNodeHandleReadTimeout   int
+	FlashNodeReadDataNodeTimeout int
+	RemoteCacheTTL               int64
+	RemoteCacheReadTimeout       int64
+	RemoteCacheMultiRead         bool
+	FlashNodeTimeoutCount        int64
+	RemoteCacheSameZoneTimeout   int64
+	RemoteCacheSameRegionTimeout int64
+	FlashHotKeyMissCount         int
+	FlashReadFlowLimit           int64
+	FlashWriteFlowLimit          int64
+	FlashKeyFlowLimit            int64
+	RemoteClientFlowLimit        int64
+	WriteChunkSize               int64
 }
 
 func ComputeSourcesVersion(sources []*DataSource, gen uint64) (version uint32) {
@@ -346,7 +525,6 @@ type FlashManualTask struct {
 	StartTime            *time.Time
 	UpdateTime           *time.Time
 	EndTime              *time.Time
-	RcvStop              bool
 	Done                 bool
 	sync.Mutex
 }
@@ -356,6 +534,9 @@ type ManualTaskConfig struct {
 	TraverseFileConcurrency int
 	HandlerFileConcurrency  int
 	TotalFileSizeLimit      int64
+	MinFileSizeLimit        int64
+	MaxFileSizeLimit        int64
+	WarmUpPathExpire        int64
 }
 
 type ManualTaskStatistics struct {
@@ -414,6 +595,9 @@ func (flt *FlashManualTask) GetPathPrefix() string {
 func (flt *FlashManualTask) SetResponse(taskRsp *FlashNodeManualTaskResponse) {
 	t := time.Now()
 	flt.UpdateTime = &t
+	if flt.ManualTaskStatistics == nil {
+		flt.ManualTaskStatistics = &ManualTaskStatistics{}
+	}
 	flt.ManualTaskStatistics.FlashNode = taskRsp.FlashNode
 	flt.ManualTaskStatistics.TotalFileScannedNum = taskRsp.TotalFileScannedNum
 	flt.ManualTaskStatistics.TotalFileCachedNum = taskRsp.TotalFileCachedNum
@@ -423,4 +607,171 @@ func (flt *FlashManualTask) SetResponse(taskRsp *FlashNodeManualTaskResponse) {
 	flt.ManualTaskStatistics.TotalCacheSize = taskRsp.TotalCacheSize
 	flt.ManualTaskStatistics.LastCacheSize = taskRsp.LastCacheSize
 	flt.Done = taskRsp.Done
+}
+
+type CacheMissEntry struct {
+	UniKey     string
+	MissCount  int32
+	expiration int64
+}
+
+func CacheMissExpired(info *CacheMissEntry) bool {
+	return time.Now().UnixNano() > info.expiration
+}
+
+func SetMissEntryExpiration(info *CacheMissEntry, t time.Duration) {
+	info.expiration = time.Now().Add(t).UnixNano()
+}
+
+func GetMissEntryExpiration(info *CacheMissEntry) int64 {
+	return info.expiration
+}
+
+func IsCacheUnRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, ErrorNoFlashGroup.Error()) || strings.Contains(errStr, ErrorNoAvailableHost.Error()) ||
+		strings.Contains(errStr, ErrorContextDeadLine.Error()) || strings.Contains(errStr, ErrorReadTimeout.Error()) {
+		return true
+	}
+	return false
+}
+
+func IsCacheMissError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), ErrorNotExistShouldCache.Error()) ||
+		strings.Contains(err.Error(), ErrorNotExistShouldNotCache.Error()) {
+		return true
+	}
+	return false
+}
+
+type WarmUpPathInfo struct {
+	DirPath     string
+	VolName     string
+	Expiration  int64
+	StartTime   int64
+	Status      int32
+	FlashAddr   string
+	LoadedCount int64
+}
+
+type WarmUpMetaResource struct {
+	DirPath    string
+	ServerAddr string
+}
+
+func MarshalBinaryWPSlice(warmUpPaths []*WarmUpPathInfo) ([]byte, error) {
+	buff := bytes.NewBuffer([]byte{})
+	if err := buff.WriteByte(WarnMagicNumber); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buff, binary.BigEndian, int32(len(warmUpPaths))); err != nil {
+		return nil, err
+	}
+
+	for _, pathInfo := range warmUpPaths {
+		data, err := pathInfo.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := buff.Write(data); err != nil {
+			return nil, err
+		}
+	}
+	return buff.Bytes(), nil
+}
+
+func (w *WarmUpPathInfo) MarshalBinary() ([]byte, error) {
+	buff := bytes.NewBuffer([]byte{})
+	if err := w.MarshalBinaryWithBuffer(buff); err != nil {
+		return nil, err
+	}
+	return buff.Bytes(), nil
+}
+
+func (w *WarmUpPathInfo) MarshalBinaryWithBuffer(buff *bytes.Buffer) error {
+	dirPathBytes := []byte(w.DirPath)
+	if err := binary.Write(buff, binary.BigEndian, uint32(len(dirPathBytes))); err != nil {
+		return err
+	}
+	if _, err := buff.Write(dirPathBytes); err != nil {
+		return err
+	}
+	volNameBytes := []byte(w.VolName)
+	if err := binary.Write(buff, binary.BigEndian, uint32(len(volNameBytes))); err != nil {
+		return err
+	}
+	if _, err := buff.Write(volNameBytes); err != nil {
+		return err
+	}
+	if err := binary.Write(buff, binary.BigEndian, w.Expiration); err != nil {
+		return err
+	}
+	return nil
+}
+
+func UnmarshalBinaryWPSlice(data []byte) ([]*WarmUpPathInfo, error) {
+	if len(data) <= 0 {
+		return nil, fmt.Errorf("empty data")
+	}
+	magic := data[0]
+	if magic != WarnMagicNumber {
+		return nil, fmt.Errorf("invalid magic number: expected %d, got %d", WarnMagicNumber, magic)
+	}
+	buff := bytes.NewBuffer(data[1:])
+	var length int32
+	if err := binary.Read(buff, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+
+	warmUpPaths := make([]*WarmUpPathInfo, length)
+	for i := int32(0); i < length; i++ {
+		pathInfo := &WarmUpPathInfo{}
+		if err := pathInfo.UnmarshalBinaryWithBuffer(buff); err != nil {
+			return nil, err
+		}
+		warmUpPaths[i] = pathInfo
+	}
+
+	return warmUpPaths, nil
+}
+
+func (w *WarmUpPathInfo) UnmarshalBinaryWithBuffer(buff *bytes.Buffer) error {
+	var dirPathLen uint32
+	if err := binary.Read(buff, binary.BigEndian, &dirPathLen); err != nil {
+		return err
+	}
+	dirPathBytes := make([]byte, dirPathLen)
+	if _, err := buff.Read(dirPathBytes); err != nil {
+		return err
+	}
+	w.DirPath = string(dirPathBytes)
+
+	var volNameLen uint32
+	if err := binary.Read(buff, binary.BigEndian, &volNameLen); err != nil {
+		return err
+	}
+	volNameBytes := make([]byte, volNameLen)
+	if _, err := buff.Read(volNameBytes); err != nil {
+		return err
+	}
+	w.VolName = string(volNameBytes)
+	if err := binary.Read(buff, binary.BigEndian, &w.Expiration); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (w *WarmUpPathInfo) UnmarshalBinary(data []byte) error {
+	return w.UnmarshalBinaryWithBuffer(bytes.NewBuffer(data))
+}
+
+func (w *WarmUpPathInfo) SetExpiration(t time.Duration) {
+	w.Expiration = time.Now().Add(t).UnixNano()
 }

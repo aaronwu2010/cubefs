@@ -87,6 +87,23 @@ func (f RotatedFile) Swap(i, j int) {
 	f[i], f[j] = f[j], f[i]
 }
 
+func ParseLogLevel(loglvl string) Level {
+	var level Level
+	switch strings.ToLower(loglvl) {
+	case "debug":
+		level = DebugLevel
+	case "info":
+		level = InfoLevel
+	case "warn":
+		level = WarnLevel
+	case "error":
+		level = ErrorLevel
+	default:
+		level = ErrorLevel
+	}
+	return level
+}
+
 func setBlobLogLevel(loglevel Level) {
 	blevel := blog.Lwarn
 	switch loglevel {
@@ -896,7 +913,7 @@ func (l *Log) removeLogFile(logDir string, diskSpaceLeft int64, module string) (
 	// delete old file
 	for _, info := range needDelFiles {
 		if err = os.Remove(path.Join(logDir, info.Name())); err != nil {
-			LogErrorf("failed delete log file %s", info.Name())
+			LogErrorf("failed delete log file %v:%v", info.Name(), err.Error())
 			continue
 		}
 		diskSpaceLeft += info.Size()

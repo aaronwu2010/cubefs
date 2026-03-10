@@ -671,7 +671,7 @@ func (mm *monitorMetrics) setMpAndDpMetrics() {
 
 	vols := mm.cluster.copyVols()
 	for _, vol := range vols {
-		if (vol.Status == proto.VolStatusMarkDelete && !vol.Forbidden) || (vol.Status == proto.VolStatusMarkDelete && vol.Forbidden && vol.DeleteExecTime.Before(time.Now())) {
+		if vol.IsDeleted() {
 			continue
 		}
 
@@ -918,20 +918,12 @@ func (mm *monitorMetrics) setFlashNodesDiskErrorMetric() {
 		mm.flashNodesDiskError.DeleteLabelValues(v, k)
 	}
 
-	mm.cluster.flashNodeTopo.flashNodeMap.Range(func(addr, node interface{}) bool {
-		flashNode, ok := node.(*FlashNode)
-		if !ok {
-			return true
-		}
-		for _, disk := range flashNode.DiskStat {
-			if disk.Status == proto.Unavailable {
-				key := fmt.Sprintf("%s_%s", flashNode.Addr, disk.DataPath)
-				mm.flashNodesDiskError.SetWithLabelValues(1, flashNode.Addr, key)
-				mm.flashNodesBadDisks[key] = flashNode.Addr
-			}
-		}
-		return true
-	})
+	infos := mm.cluster.flashNodeTopo.BadDiskInfos()
+	for _, info := range infos {
+		key := fmt.Sprintf("%s_%s", info.Addr, info.DiskPath)
+		mm.flashNodesDiskError.SetWithLabelValues(1, info.Addr, key)
+		mm.flashNodesBadDisks[key] = info.Addr
+	}
 }
 
 func (mm *monitorMetrics) setDiskLostMetric() {
@@ -987,7 +979,7 @@ func (mm *monitorMetrics) setBadDiskDecommissionTimeOverLimit() {
 		for _, badDiskStat := range dataNode.BadDiskStats {
 			_, isSuccess := dataNode.DecommissionSuccessDisks.Load(badDiskStat.DiskPath)
 			if !badDiskStat.FirstReportTime.IsZero() && time.Since(badDiskStat.FirstReportTime) > 24*time.Hour && !isSuccess {
-				mm.badDiskDecommissionTimeOverLimit.SetWithLabelValues(1, dataNode.Addr, badDiskStat.DiskPath,
+				mm.badDiskDecommissionTimeOverLimit.SetWithLabelValues(time.Since(badDiskStat.FirstReportTime).Hours(), dataNode.Addr, badDiskStat.DiskPath,
 					badDiskStat.FirstReportTime.Format("2006-01-02 15:04:05"))
 			}
 		}
@@ -1003,10 +995,20 @@ func (mm *monitorMetrics) setDiskDecommissionedMetric() {
 		if !ok {
 			return true
 		}
-		disks := dataNode.getDecommissionSuccessDisks()
-		for _, disk := range disks {
-			key := fmt.Sprintf("%s_%s", dataNode.Addr, disk)
-			mm.diskDecommissionSuccess.SetWithLabelValues(1, dataNode.Addr, key)
+		if dataNode.GetDecommissionStatus() != DecommissionInitial &&
+			dataNode.GetDecommissionStatus() != DecommissionFail {
+			return true
+		}
+		successDisks := dataNode.getDecommissionSuccessDisks()
+		successDiskMap := make(map[string]struct{})
+		for _, disk := range successDisks {
+			successDiskMap[disk] = struct{}{}
+		}
+		for _, badDisk := range dataNode.BadDisks {
+			if _, exists := successDiskMap[badDisk]; exists {
+				key := fmt.Sprintf("%s_%s", dataNode.Addr, badDisk)
+				mm.diskDecommissionSuccess.SetWithLabelValues(1, dataNode.Addr, key)
+			}
 		}
 		return true
 	})
@@ -1382,4 +1384,5 @@ func (mm *monitorMetrics) resetAllLeaderMetrics() {
 	mm.MpMissingReplicaCount.Set(0)
 	mm.ReplicaMissingDPCount.Reset()
 	mm.DpMissingLeaderCount.Reset()
+	mm.nodeStat.Reset()
 }

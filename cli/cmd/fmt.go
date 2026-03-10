@@ -98,6 +98,16 @@ func formatClusterView(cv *proto.ClusterView, cn *proto.ClusterNodeInfo, cp *pro
 
 	sb.WriteString(fmt.Sprintf("  FlashNodeHandleReadTimeout       : %v ms\n", cv.FlashNodeHandleReadTimeout))
 	sb.WriteString(fmt.Sprintf("  FlashNodeReadDataNodeTimeout     : %v ms\n", cv.FlashNodeReadDataNodeTimeout))
+	sb.WriteString(fmt.Sprintf("  RemoteCacheTTL                   : %v s\n", cv.RemoteCacheTTL))
+	sb.WriteString(fmt.Sprintf("  RemoteCacheReadTimeout           : %v ms\n", cv.RemoteCacheReadTimeout))
+	sb.WriteString(fmt.Sprintf("  RemoteCacheMultiRead             : %v\n", cv.RemoteCacheMultiRead))
+	sb.WriteString(fmt.Sprintf("  FlashNodeTimeoutCount            : %v\n", cv.FlashNodeTimeoutCount))
+	// sb.WriteString(fmt.Sprintf("  RemoteCacheSameZoneTimeout       : %v microsecond\n", cv.RemoteCacheSameZoneTimeout))
+	// sb.WriteString(fmt.Sprintf("  RemoteCacheSameRegionTimeout     : %v millisecond\n", cv.RemoteCacheSameRegionTimeout))
+	sb.WriteString(fmt.Sprintf("  FlashHotKeyMissCount             : %v\n", cv.FlashHotKeyMissCount))
+	sb.WriteString(fmt.Sprintf("  FlashReadFlowLimit               : %v\n", cv.FlashReadFlowLimit))
+	sb.WriteString(fmt.Sprintf("  FlashWriteFlowLimit              : %v\n", cv.FlashWriteFlowLimit))
+	sb.WriteString(fmt.Sprintf("  FlashKeyFlowLimit                : %v\n", cv.FlashKeyFlowLimit))
 	return sb.String()
 }
 
@@ -1330,8 +1340,10 @@ func formatDiskDataPartitionTableRow(view *proto.DataPartitionReport) string {
 func formatDataNodeDecommissionProgress(progress *proto.DataDecommissionProgress) string {
 	sb := strings.Builder{}
 	sb.WriteString(fmt.Sprintf("Status     :         %v\n", progress.StatusMessage))
+	sb.WriteString(fmt.Sprintf("Weight     :         %v\n", progress.Weight))
 	sb.WriteString(fmt.Sprintf("Progress   :         %v\n", progress.Progress))
 	sb.WriteString(fmt.Sprintf("TotalDpCnt :         %v\n", progress.TotalDpCnt))
+	sb.WriteString(fmt.Sprintf("RemainingDpCnt:      %v\n", progress.RemainingDpCnt))
 	if len(progress.RunningDps) != 0 {
 		sb.WriteString("running Dps:       \n")
 		for i, info := range progress.RunningDps {
@@ -1351,8 +1363,11 @@ func formatDataNodeDecommissionProgress(progress *proto.DataDecommissionProgress
 func formatDecommissionProgress(progress *proto.DecommissionProgress) string {
 	sb := strings.Builder{}
 	sb.WriteString(fmt.Sprintf("Status     :         %v\n", progress.StatusMessage))
+	sb.WriteString(fmt.Sprintf("Type       :         %v\n", progress.DecommissionType))
+	sb.WriteString(fmt.Sprintf("Weight     :         %v\n", progress.Weight))
 	sb.WriteString(fmt.Sprintf("Progress   :         %v\n", progress.Progress))
 	sb.WriteString(fmt.Sprintf("TotalDpCnt :         %v\n", progress.TotalDpCnt))
+	sb.WriteString(fmt.Sprintf("RemainingDpCnt:      %v\n", progress.RemainingDpCnt))
 	if len(progress.RunningDps) != 0 {
 		sb.WriteString("running Dps:       \n")
 		for i, info := range progress.RunningDps {
@@ -1379,6 +1394,7 @@ func formatDataPartitionDecommissionProgress(info *proto.DecommissionDataPartiti
 	sb := strings.Builder{}
 	sb.WriteString(fmt.Sprintf("Status:            %v\n", info.Status))
 	sb.WriteString(fmt.Sprintf("SpecialStep:       %v\n", info.SpecialStep))
+	sb.WriteString(fmt.Sprintf("Progress:          %v\n", info.Progress))
 	sb.WriteString(fmt.Sprintf("DiskRetryMap:      %v\n", info.DiskRetryMap))
 	sb.WriteString(fmt.Sprintf("Retry:             %v\n", info.Retry))
 	sb.WriteString(fmt.Sprintf("RaftForce:         %v\n", info.RaftForce))
@@ -1392,6 +1408,21 @@ func formatDataPartitionDecommissionProgress(info *proto.DecommissionDataPartiti
 	sb.WriteString(fmt.Sprintf("Replicas:          %v\n", info.Replicas))
 	sb.WriteString(fmt.Sprintf("NeedRollbackTimes: %v\n", info.NeedRollbackTimes))
 	sb.WriteString(fmt.Sprintf("ErrorMessage:      %v\n", info.ErrorMessage))
+	return sb.String()
+}
+
+func formatDataPartitionDecommissionStatusUpdateRecords(records []*proto.DecommissionStatusRecord) string {
+	sb := strings.Builder{}
+	if len(records) != 0 {
+		sb.WriteString("decommission status update records:       \n")
+		for _, record := range records {
+			sb.WriteString(fmt.Sprintf("      Condition         : %v\n", record.Condition))
+			sb.WriteString(fmt.Sprintf("      Status            : %v\n", record.Status))
+			sb.WriteString(fmt.Sprintf("      Time              : %v\n", record.Time))
+			sb.WriteString(fmt.Sprintf("      ErrMessage        : %v\n", record.ErrMessage))
+			sb.WriteString("\n")
+		}
+	}
 	return sb.String()
 }
 
@@ -1481,7 +1512,7 @@ var (
 		"STORAGE CLASS", "INODE COUNT", "USED SIZE", "QUOTA")
 	formatFlashNodeSimpleViewTableTitle = arow("Zone", "ID", "Address", "Active", "Enable", "FlashGroupID", "ReportTime")
 	formatFlashNodeViewTableTitle       = append(formatFlashNodeSimpleViewTableTitle[:], "DataPath", "HitRate", "Evicts", "Limit", "MaxAlloc", "HasAlloc", "Num", "Status")
-	formatFlashGroupViewTile            = arow("ID", "Weight", "Slots", "Status", "SlotStatus", "PendingSlots", "Step", "FlashNodeCount")
+	formatFlashGroupViewTile            = arow("ID", "Weight", "Slots", "ReservedSlots", "Status", "SlotStatus", "PendingSlots", "Step", "FlashNodeCount", "ReducingSlots")
 	QosHeader                           = fmt.Sprintf(qosPattern, "NAME", "TOTAL-MB", "USED-MB")
 )
 
@@ -1508,6 +1539,8 @@ func formatFlashGroupView(fg *proto.FlashGroupAdminView) string {
 		fmt.Sprintf("  ID:%v\n", fg.ID) +
 		fmt.Sprintf("  Weight:%v\n", fg.Weight) +
 		fmt.Sprintf("  Slots:%v\n", fg.Slots) +
+		fmt.Sprintf("  ReservedSlots:%v\n", fg.ReservedSlots) +
+		fmt.Sprintf("  IsReducingSlots:%v\n", fg.IsReducingSlots) +
 		fmt.Sprintf("  Status:%v\n", fg.Status) +
 		fmt.Sprintf("  SlotStatus:%v\n", fg.SlotStatus) +
 		fmt.Sprintf("  PedningSlots:%v\n", fg.PendingSlots) +

@@ -967,6 +967,11 @@ func (m *Server) getCluster(w http.ResponseWriter, r *http.Request) {
 		FlashNodes:                   make([]proto.NodeView, 0),
 		FlashNodeHandleReadTimeout:   m.cluster.cfg.flashNodeHandleReadTimeout,
 		FlashNodeReadDataNodeTimeout: m.cluster.cfg.flashNodeReadDataNodeTimeout,
+		FlashHotKeyMissCount:         m.cluster.cfg.flashHotKeyMissCount,
+		FlashReadFlowLimit:           m.cluster.cfg.flashReadFlowLimit,
+		FlashWriteFlowLimit:          m.cluster.cfg.flashWriteFlowLimit,
+		FlashKeyFlowLimit:            m.cluster.cfg.flashKeyFlowLimit,
+		RemoteClientFlowLimit:        m.cluster.cfg.remoteClientFlowLimit,
 	}
 
 	vols := m.cluster.allVolNames()
@@ -1175,6 +1180,8 @@ func (m *Server) getIPAddr(w http.ResponseWriter, r *http.Request) {
 		DataNodeAutoRepairLimitRate: autoRepairRate,
 		DpMaxRepairErrCnt:           dpMaxRepairErrCnt,
 		DirChildrenNumLimit:         dirChildrenNumLimit,
+		FlashReadTimeout:            m.cluster.cfg.flashNodeHandleReadTimeout,
+		FlashKeyFlowLimit:           m.cluster.cfg.flashKeyFlowLimit,
 		// Ip:                          strings.Split(r.RemoteAddr, ":")[0],
 		Ip:                                 iputil.RealIP(r),
 		EbsAddr:                            m.bStoreAddr,
@@ -1840,7 +1847,7 @@ func (m *Server) addDataReplica(w http.ResponseWriter, r *http.Request) {
 	dp.DecommissionType = ManualAddReplica
 	dp.RecoverStartTime = time.Now()
 	dp.RecoverUpdateTime = time.Now()
-	dp.SetDecommissionStatus(DecommissionRunning)
+	dp.SetDecommissionStatus(DecommissionRunning, "manualAddReplica", "")
 
 	var newReplica *DataReplica
 	if newReplica, err = dp.getReplica(addr); err != nil {
@@ -2154,7 +2161,8 @@ func (m *Server) decommissionDataPartition(w http.ResponseWriter, r *http.Reques
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: rstMsg})
 		return
 	}
-	err = m.cluster.markDecommissionDataPartition(dp, node, dstNodeSet, raftForce, uint32(decommissionType), weight)
+	triggerCondition := fmt.Sprintf("manualDecommission_dp(%v)", dp.PartitionID)
+	err = m.cluster.markDecommissionDataPartition(dp, node, dstNodeSet, raftForce, uint32(decommissionType), weight, triggerCondition)
 	if err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
@@ -2293,6 +2301,27 @@ func (m *Server) resetDataPartitionDecommissionStatus(w http.ResponseWriter, r *
 	sendOkReply(w, r, newSuccessHTTPReply(msg))
 }
 
+func (m *Server) queryDataPartitionDecommissionStatusUpdateRecords(w http.ResponseWriter, r *http.Request) {
+	var (
+		dp          *DataPartition
+		partitionID uint64
+		err         error
+		records     []*proto.DecommissionStatusRecord
+	)
+
+	if partitionID, err = parseRequestToLoadDataPartition(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	if dp, err = m.cluster.getDataPartitionByID(partitionID); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrDataPartitionNotExists))
+		return
+	}
+	records = dp.cloneDecommissionStatusRecords()
+	sendOkReply(w, r, newSuccessHTTPReply(records))
+}
+
 func (m *Server) queryDataPartitionDecommissionStatus(w http.ResponseWriter, r *http.Request) {
 	var (
 		dp           *DataPartition
@@ -2300,6 +2329,8 @@ func (m *Server) queryDataPartitionDecommissionStatus(w http.ResponseWriter, r *
 		err          error
 		replicas     []string
 		diskRetryMap map[string]int
+		dataReplica  *DataReplica
+		progress     string
 	)
 
 	if partitionID, err = parseRequestToLoadDataPartition(r); err != nil {
@@ -2315,11 +2346,18 @@ func (m *Server) queryDataPartitionDecommissionStatus(w http.ResponseWriter, r *
 		replicas = append(replicas, replica.Addr)
 	}
 	diskRetryMap = dp.cloneDecommissionDiskRetryMap()
+	if dp.DecommissionDstAddr != "" {
+		if dataReplica, err = dp.getReplica(dp.DecommissionDstAddr); err == nil {
+			progress = fmt.Sprintf("%.2f%%", dataReplica.DecommissionRepairProgress*float64(100))
+		}
+	}
+
 	info := &proto.DecommissionDataPartitionInfo{
 		PartitionId:           partitionID,
 		ReplicaNum:            dp.ReplicaNum,
 		Status:                GetDecommissionStatusMessage(dp.GetDecommissionStatus()),
 		SpecialStep:           GetSpecialDecommissionStatusMessage(dp.GetSpecialReplicaDecommissionStep()),
+		Progress:              progress,
 		DiskRetryMap:          diskRetryMap,
 		Retry:                 dp.DecommissionRetry,
 		RaftForce:             dp.DecommissionRaftForce,
@@ -3083,6 +3121,13 @@ func (m *Server) getVolSimpleInfo(w http.ResponseWriter, r *http.Request) {
 	)
 	metric := exporter.NewTPCnt("req" + strings.Replace(proto.AdminGetVol, "/", "_", -1))
 	defer func() {
+		if err != nil {
+			msg := fmt.Sprintf("getVolSimpleInfo: vol(%v) failed, remoteAddr(%s), srcRealIp(%s), err (%s)",
+				name, r.RemoteAddr, iputil.GetRealClientIP(r), err.Error())
+			auditlog.LogMasterOp(proto.AdminGetVol, msg, err)
+			exporter.NewCounter("getVolFailed").Add(1)
+			return
+		}
 		doStatAndMetric(proto.AdminGetVol, metric, err, map[string]string{exporter.Vol: name})
 	}()
 
@@ -3351,7 +3396,7 @@ func (m *Server) getDataNode(w http.ResponseWriter, r *http.Request) {
 		DecommissionedDisk:                    dataNode.getDecommissionedDisks(),
 		DecommissionSuccessDisk:               dataNode.getDecommissionSuccessDisks(),
 		BackupDataPartitions:                  dataNode.getBackupDataPartitionIDs(),
-		PersistenceDataPartitionsWithDiskPath: m.cluster.getAllDataPartitionWithDiskPathByDataNode(nodeAddr),
+		PersistenceDataPartitionsWithDiskPath: m.cluster.getAllDataPartitionWithDiskPathByDataNode(nodeAddr, ignoreDiscardDp),
 		MediaType:                             dataNode.MediaType,
 		DiskOpLogs:                            dataNode.DiskOpLogs,
 		DpOpLogs:                              dataNode.DpOpLogs,
@@ -3674,6 +3719,51 @@ func (m *Server) setNodeInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if val, ok := params[flashNodeHandleReadTimeout]; ok {
 		if v, ok := val.(int64); ok {
 			if err = m.setConfig(flashNodeHandleReadTimeout, strconv.FormatInt(v, 10)); err != nil {
+				sendErrReply(w, r, newErrHTTPReply(err))
+				return
+			}
+		}
+	}
+
+	if val, ok := params[flashHotKeyMissCount]; ok {
+		if v, ok := val.(int64); ok {
+			if err = m.setConfig(flashHotKeyMissCount, strconv.FormatInt(v, 10)); err != nil {
+				sendErrReply(w, r, newErrHTTPReply(err))
+				return
+			}
+		}
+	}
+
+	if val, ok := params[flashReadFlowLimit]; ok {
+		if v, ok := val.(int64); ok {
+			if err = m.setConfig(flashReadFlowLimit, strconv.FormatInt(v, 10)); err != nil {
+				sendErrReply(w, r, newErrHTTPReply(err))
+				return
+			}
+		}
+	}
+
+	if val, ok := params[flashWriteFlowLimit]; ok {
+		if v, ok := val.(int64); ok {
+			if err = m.setConfig(flashWriteFlowLimit, strconv.FormatInt(v, 10)); err != nil {
+				sendErrReply(w, r, newErrHTTPReply(err))
+				return
+			}
+		}
+	}
+
+	if val, ok := params[flashKeyFlowLimit]; ok {
+		if v, ok := val.(int64); ok {
+			if err = m.setConfig(flashKeyFlowLimit, strconv.FormatInt(v, 10)); err != nil {
+				sendErrReply(w, r, newErrHTTPReply(err))
+				return
+			}
+		}
+	}
+
+	if val, ok := params[remoteClientFlowLimit]; ok {
+		if v, ok := val.(int64); ok {
+			if err = m.setConfig(remoteClientFlowLimit, strconv.FormatInt(v, 10)); err != nil {
 				sendErrReply(w, r, newErrHTTPReply(err))
 				return
 			}
@@ -4937,6 +5027,19 @@ func (m *Server) queryDiskDecoProgress(w http.ResponseWriter, r *http.Request) {
 	key := fmt.Sprintf("%s_%s", offLineAddr, diskPath)
 	value, ok := m.cluster.DecommissionDisks.Load(key)
 	if !ok {
+		if dn, existsErr := m.cluster.dataNode(offLineAddr); existsErr == nil {
+			if !dn.checkDecommissionedDisks(diskPath) {
+				for _, disk := range dn.AllDisks {
+					if disk == diskPath {
+						resp := proto.DecommissionProgress{
+							StatusMessage: GetDecommissionStatusMessage(DecommissionInitial),
+						}
+						sendOkReply(w, r, newSuccessHTTPReply(resp))
+						return
+					}
+				}
+			}
+		}
 		ret := fmt.Sprintf("action[queryDiskDecoProgress]cannot found decommission task for node[%v] disk[%v], "+
 			"may be already offline", offLineAddr, diskPath)
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: ret})
@@ -4948,15 +5051,24 @@ func (m *Server) queryDiskDecoProgress(w http.ResponseWriter, r *http.Request) {
 	resp := &proto.DecommissionProgress{
 		Progress:                 fmt.Sprintf("%.2f%%", progress*float64(100)),
 		StatusMessage:            GetDecommissionStatusMessage(status),
-		TotalDpCnt:               disk.DecommissionDpTotal,
+		DecommissionType:         GetDecommissionTypeMessage(disk.Type),
+		Weight:                   disk.DecommissionWeight,
+		TotalDpCnt:               disk.GetDecommissionTotalDpCnt(m.cluster),
 		IgnoreDps:                disk.IgnoreDecommissionDps,
 		ResidualDps:              disk.residualDecommissionDpsGetAll(),
 		StartTime:                time.Unix(int64(disk.DecommissionTerm), 0).String(),
 		IsManualDecommissionDisk: disk.IsManualDecommissionDisk(),
 	}
-	failedDps, runningDps := disk.GetDecommissionFailedAndRunningDPByTerm(m.cluster)
-	resp.FailedDps = failedDps
-	resp.RunningDps = runningDps
+	if status == markDecommission {
+		resp.RemainingDpCnt = resp.TotalDpCnt
+		resp.FailedDps = nil
+		resp.RunningDps = nil
+	} else {
+		remainingDpCnt, failedDps, runningDps := disk.GetDecommissionFailedAndRunningDPByTerm(m.cluster)
+		resp.RemainingDpCnt = remainingDpCnt + len(resp.IgnoreDps) + len(resp.ResidualDps)
+		resp.FailedDps = failedDps
+		resp.RunningDps = runningDps
+	}
 	retryOverLimitDps := disk.GetDecommissionDiskRetryOverLimitDP(m.cluster)
 	resp.RetryOverLimitDps = retryOverLimitDps
 	sendOkReply(w, r, newSuccessHTTPReply(resp))
@@ -5016,6 +5128,8 @@ func (m *Server) queryAllDecommissionDisk(w http.ResponseWriter, r *http.Request
 			decommissionProgress := proto.DecommissionProgress{
 				Progress:                 fmt.Sprintf("%.2f%%", progress*float64(100)),
 				StatusMessage:            GetDecommissionStatusMessage(status),
+				DecommissionType:         GetDecommissionTypeMessage(disk.Type),
+				Weight:                   disk.DecommissionWeight,
 				TotalDpCnt:               disk.GetDecommissionTotalDpCnt(m.cluster),
 				IgnoreDps:                disk.IgnoreDecommissionDps,
 				ResidualDps:              disk.residualDecommissionDpsGetAll(),
@@ -5023,20 +5137,21 @@ func (m *Server) queryAllDecommissionDisk(w http.ResponseWriter, r *http.Request
 				IsManualDecommissionDisk: disk.IsManualDecommissionDisk(),
 			}
 			if status == markDecommission {
-				decommissionProgress.FailedDps = make([]proto.FailedDpInfo, 0)
-				decommissionProgress.RunningDps = make([]uint64, 0)
+				decommissionProgress.RemainingDpCnt = decommissionProgress.TotalDpCnt
+				decommissionProgress.FailedDps = nil
+				decommissionProgress.RunningDps = nil
 			} else {
-				failedDps, runningDps := disk.GetDecommissionFailedAndRunningDPByTerm(m.cluster)
+				remainingDpCnt, failedDps, runningDps := disk.GetDecommissionFailedAndRunningDPByTerm(m.cluster)
+				decommissionProgress.RemainingDpCnt = remainingDpCnt + len(decommissionProgress.IgnoreDps) + len(decommissionProgress.ResidualDps)
 				decommissionProgress.FailedDps = failedDps
 				decommissionProgress.RunningDps = runningDps
 			}
 			retryOverLimitDps := disk.GetDecommissionDiskRetryOverLimitDP(m.cluster)
 			decommissionProgress.RetryOverLimitDps = retryOverLimitDps
 			resp.Infos = append(resp.Infos, proto.DecommissionDiskInfo{
-				SrcAddr:            disk.SrcAddr,
-				DiskPath:           disk.DiskPath,
-				DecommissionWeight: disk.DecommissionWeight,
-				ProgressInfo:       decommissionProgress,
+				SrcAddr:      disk.SrcAddr,
+				DiskPath:     disk.DiskPath,
+				ProgressInfo: decommissionProgress,
 			})
 		}
 		return true
@@ -6769,15 +6884,18 @@ func (m *Server) queryDataNodeDecoProgress(w http.ResponseWriter, r *http.Reques
 	progress, _ = FormatFloatFloor(progress, 4)
 	resp := &proto.DataDecommissionProgress{
 		Status:        status,
+		Weight:        dn.DecommissionWeight,
 		Progress:      fmt.Sprintf("%.2f%%", progress*float64(100)),
 		StatusMessage: GetDecommissionStatusMessage(status),
 		TotalDpCnt:    dn.DecommissionDpTotal,
+		StartTime:     time.Unix(int64(dn.DecommissionTime), 0).String(),
 	}
-	failedDps, runningDps := dn.GetDecommissionFailedAndRunningDPByTerm(m.cluster)
+	remainingDpCnt, failedDps, runningDps := dn.GetDecommissionFailedAndRunningDPByTerm(m.cluster)
 	resp.FailedDps = failedDps
 	resp.RunningDps = runningDps
 	resp.IgnoreDps = dn.getIgnoreDecommissionDpList(m.cluster)
 	resp.ResidualDps = dn.getResidualDecommissionDpList(m.cluster)
+	resp.RemainingDpCnt = remainingDpCnt + len(resp.IgnoreDps) + len(resp.ResidualDps)
 
 	sendOkReply(w, r, newSuccessHTTPReply(resp))
 }
@@ -7175,7 +7293,13 @@ func (m *Server) setConfig(key string, value string) (err error) {
 		autoMigrate              bool
 		fnHandleReadTimeout      int
 		fnReadDataNodeTimeout    int
+		fnHotKeyMissCount        int
+		fnReadFlowLimit          int64
+		fnWriteFlowLimit         int64
+		fnKeyFlowLimit           int64
+		fnRemoteClientFlowLimit  int64
 		oldIntValue              int
+		oldInt64Value            int64
 	)
 
 	switch key {
@@ -7224,6 +7348,46 @@ func (m *Server) setConfig(key string, value string) (err error) {
 		oldIntValue = m.config.flashNodeReadDataNodeTimeout
 		m.config.flashNodeReadDataNodeTimeout = fnReadDataNodeTimeout
 
+	case flashHotKeyMissCount:
+		fnHotKeyMissCount, err = strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		oldIntValue = m.config.flashHotKeyMissCount
+		m.config.flashHotKeyMissCount = fnHotKeyMissCount
+
+	case flashReadFlowLimit:
+		fnReadFlowLimit, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return err
+		}
+		oldInt64Value = m.config.flashReadFlowLimit
+		m.config.flashReadFlowLimit = fnReadFlowLimit
+
+	case flashWriteFlowLimit:
+		fnWriteFlowLimit, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return err
+		}
+		oldInt64Value = m.config.flashWriteFlowLimit
+		m.config.flashWriteFlowLimit = fnWriteFlowLimit
+
+	case flashKeyFlowLimit:
+		fnKeyFlowLimit, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return err
+		}
+		oldInt64Value = m.config.flashKeyFlowLimit
+		m.config.flashKeyFlowLimit = fnKeyFlowLimit
+
+	case remoteClientFlowLimit:
+		fnRemoteClientFlowLimit, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return err
+		}
+		oldInt64Value = m.config.remoteClientFlowLimit
+		m.config.remoteClientFlowLimit = fnRemoteClientFlowLimit
+
 	default:
 		err = keyNotFound("config")
 		return err
@@ -7243,6 +7407,16 @@ func (m *Server) setConfig(key string, value string) (err error) {
 			m.config.flashNodeHandleReadTimeout = oldIntValue
 		case flashNodeReadDataNodeTimeout:
 			m.config.flashNodeReadDataNodeTimeout = oldIntValue
+		case flashHotKeyMissCount:
+			m.config.flashHotKeyMissCount = oldIntValue
+		case flashReadFlowLimit:
+			m.config.flashReadFlowLimit = oldInt64Value
+		case flashWriteFlowLimit:
+			m.config.flashWriteFlowLimit = oldInt64Value
+		case flashKeyFlowLimit:
+			m.config.flashKeyFlowLimit = oldInt64Value
+		case remoteClientFlowLimit:
+			m.config.remoteClientFlowLimit = oldInt64Value
 		}
 		log.LogErrorf("setConfig syncPutCluster fail err %v", err)
 		return err
@@ -7270,6 +7444,14 @@ func (m *Server) getConfig(key string) (value string, err error) {
 		value = strconv.Itoa(m.config.flashNodeHandleReadTimeout)
 	case flashNodeReadDataNodeTimeout:
 		value = strconv.Itoa(m.config.flashNodeReadDataNodeTimeout)
+	case flashHotKeyMissCount:
+		value = strconv.Itoa(m.config.flashHotKeyMissCount)
+	case flashReadFlowLimit:
+		value = strconv.FormatInt(m.config.flashReadFlowLimit, 10)
+	case flashWriteFlowLimit:
+		value = strconv.FormatInt(m.config.flashWriteFlowLimit, 10)
+	case remoteClientFlowLimit:
+		value = strconv.FormatInt(m.config.remoteClientFlowLimit, 10)
 	default:
 		err = keyNotFound("config")
 	}
@@ -7672,11 +7854,15 @@ func (m *Server) queryDisks(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, ds := range dataNode.DiskStats {
+			status := proto.DiskStatusMap[ds.Status]
+			if contains(dataNode.LostDisks, ds.DiskPath) {
+				status = proto.DiskStatusMap[proto.Unavailable]
+			}
 			info := proto.DiskInfo{
 				NodeId:               dataNode.ID,
 				Address:              dataNode.Addr,
 				Path:                 ds.DiskPath,
-				Status:               proto.DiskStatusMap[ds.Status],
+				Status:               status,
 				TotalPartitionCnt:    ds.TotalPartitionCnt,
 				DiskErrPartitionList: ds.DiskErrPartitionList,
 			}

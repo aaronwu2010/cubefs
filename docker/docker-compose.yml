@@ -1,3 +1,4 @@
+version: '2.1'
 
 x-define-image: &image
     image: ${IMAGE}
@@ -56,6 +57,15 @@ x-define-flashnode: &flashnode
         - "17520"
         - 9500
 
+x-define-flashgroupmanager: &flashgroupmanager
+    <<: *servernode
+    ports:
+        - "5901"
+        - "5902"
+        - "17010"
+        - "17020"
+        - 9500
+
 x-define-command: &command
     <<: [*image, *env]
     volumes:
@@ -102,6 +112,9 @@ services:
             - flashnode1
             - flashnode2
             - flashnode3
+            - flashgroupmanager1
+            - flashgroupmanager2
+            - flashgroupmanager3
             - console1
             - nginx
         networks:
@@ -323,7 +336,39 @@ services:
         networks:
             extnetwork:
                 ipv4_address: 192.168.0.73
-
+    flashgroupmanager1:
+        <<: *flashgroupmanager
+        volumes:
+            - ${DiskPath:-./docker_data}/flashgroupmanager1/data:/cfs/data
+            - ./bin:/cfs/bin:ro
+            - ${DiskPath:-./docker_data}/flashgroupmanager1/log:/cfs/log
+            - ./conf/flashgroupmanager1.json:/cfs/conf/flashgroupmanager.json
+            - ./script/start_flashgroupmanager.sh:/cfs/script/start.sh
+        networks:
+            extnetwork:
+                ipv4_address: 192.168.0.81
+    flashgroupmanager2:
+        <<: *flashgroupmanager
+        volumes:
+            - ${DiskPath:-./docker_data}/flashgroupmanager2/data:/cfs/data
+            - ./bin:/cfs/bin:ro
+            - ${DiskPath:-./docker_data}/flashgroupmanager2/log:/cfs/log
+            - ./conf/flashgroupmanager2.json:/cfs/conf/flashgroupmanager.json
+            - ./script/start_flashgroupmanager.sh:/cfs/script/start.sh
+        networks:
+            extnetwork:
+                ipv4_address: 192.168.0.82
+    flashgroupmanager3:
+        <<: *flashgroupmanager
+        volumes:
+            - ${DiskPath:-./docker_data}/flashgroupmanager3/data:/cfs/data
+            - ./bin:/cfs/bin:ro
+            - ${DiskPath:-./docker_data}/flashgroupmanager3/log:/cfs/log
+            - ./conf/flashgroupmanager3.json:/cfs/conf/flashgroupmanager.json
+            - ./script/start_flashgroupmanager.sh:/cfs/script/start.sh
+        networks:
+            extnetwork:
+                ipv4_address: 192.168.0.83
     console1:
         <<: *servernode
         ports:

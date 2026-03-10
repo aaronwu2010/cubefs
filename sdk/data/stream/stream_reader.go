@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,11 +28,14 @@ import (
 
 	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/remotecache"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/buf"
+	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
+	"github.com/cubefs/cubefs/util/timeutil"
 )
 
 // One inode corresponds to one streamer. All the requests to the same inode will be queued.
@@ -64,6 +68,25 @@ type Streamer struct {
 	aheadReadEnable      bool
 	aheadReadWindow      *AheadReadWindow
 	fullPath             string
+
+	// Async flush fields
+	asyncFlushCh        chan *AsyncFlushRequest // channel for async flush requests
+	asyncFlushDone      chan struct{}           // signal to stop async flush goroutine
+	asyncFlushSemaphore chan struct{}           // semaphore to limit concurrent processAsyncFlushRequest executions
+	asyncFlushWg        sync.WaitGroup          // wait group for async flush operations
+
+	// Local async flush tracking map (per streamer)
+	pendingAsyncFlushMap sync.Map // handler.id -> *AsyncFlushRequest (using ExtentHandler ID)
+
+	// Handler protection for write operations
+	writeInProgress     bool           // indicates if a write operation is in progress
+	writeHandler        *ExtentHandler // handler being used for current write operation
+	writeProtectionLock sync.Mutex     // protects write operation state
+
+	aheadReadBlockSize uint32
+	waitForFlush       bool
+	// minimum file size to trigger ahead read (bytes)
+	minReadAheadSize int
 }
 
 type bcacheKey struct {
@@ -90,6 +113,14 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 	s.isCache = isCache
 	s.fullPath = fullPath
 
+	// Initialize async flush fields
+	s.asyncFlushCh = make(chan *AsyncFlushRequest, asyncFlushQueueSize)
+	s.asyncFlushDone = make(chan struct{})
+	s.asyncFlushSemaphore = make(chan struct{}, asyncFlushSemaphoreSize)
+
+	// Initialize local async flush tracking map
+	// sync.Map is zero value ready, no initialization needed
+
 	if log.EnableDebug() {
 		log.LogDebugf("NewStreamer: streamer(%v), reqChSize %d", s, reqChanSize)
 	}
@@ -102,10 +133,17 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 	}
 	if client.AheadRead != nil {
 		s.aheadReadEnable = client.AheadRead.enable
-		s.aheadReadWindow = NewAheadReadWindow(client.AheadRead, s)
+		s.aheadReadBlockSize = util.CacheReadBlockSize
+		// set min read ahead size from config, default 1MB when zero
+		if client.extentConfig != nil && client.extentConfig.MinReadAheadSize > 0 {
+			s.minReadAheadSize = client.extentConfig.MinReadAheadSize
+		} else {
+			s.minReadAheadSize = util.MB // 1MB default
+		}
 	}
 	go s.server()
 	go s.asyncBlockCache()
+	go s.asyncFlushManager() // Start async flush manager
 	return s
 }
 
@@ -119,8 +157,9 @@ func (s *Streamer) SetFullPath(fullPath string) {
 
 // String returns the string format of the streamer.
 func (s *Streamer) String() string {
-	return fmt.Sprintf("Streamer{ino(%v), fullPath(%v), refcnt(%v), isOpen(%v) openForWrite(%v), inflight(%v), eh(%v) addr(%p)}",
-		s.inode, s.fullPath, atomic.LoadInt32(&s.refcnt), s.isOpen, s.openForWrite, len(s.request), s.handler, s)
+	return fmt.Sprintf("Streamer{ino(%v), fullPath(%v), refcnt(%v), isOpen(%v) openForWrite(%v), request(%v), "+
+		"eh(%v) waitForFlush(%v) addr(%p)}",
+		s.inode, s.fullPath, atomic.LoadInt32(&s.refcnt), s.isOpen, s.openForWrite, len(s.request), s.handler, s.waitForFlush, s)
 }
 
 // TODO should we call it RefreshExtents instead?
@@ -177,8 +216,10 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 		reader          *ExtentReader
 		requests        []*ExtentRequest
 		revisedRequests []*ExtentRequest
+		inodeInfo       *proto.InodeInfo
 	)
 	log.LogDebugf("action[streamer.read] ino(%v) offset %v size %v", s.inode, offset, size)
+	defer log.LogDebugf("streamer read ino(%v) offset %v size %v", s.inode, offset, size)
 	ctx := context.Background()
 	if s.client.readLimit() {
 		s.client.readLimiter.Wait(ctx)
@@ -228,10 +269,17 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 			total += req.Size
 			log.LogDebugf("Stream read hole: ino(%v) req(%v) total(%v)", s.inode, req, total)
 		} else {
-			log.LogDebugf("Stream read: ino(%v) req(%v) s.needBCache(%v) s.client.bcacheEnable(%v) aheadReadEnable(%v)", s.inode, req, s.needBCache, s.client.bcacheEnable, s.aheadReadEnable)
-			if s.aheadReadEnable && req.ExtentKey.Size > util.CacheReadBlockSize {
-				readBytes, err = s.aheadRead(req)
+			log.LogDebugf("Stream read: ino(%v) req(%v) s.needBCache(%v) s.client.bcacheEnable(%v) aheadReadEnable(%v) aheadReadBlockSize(%v) %p",
+				s.inode, req, s.needBCache, s.client.bcacheEnable, s.aheadReadEnable, s.aheadReadBlockSize, s)
+			if s.aheadReadEnable && filesize > s.minReadAheadSize {
+				// Lazily initialize ahead read window when threshold is satisfied
+				if s.aheadReadWindow == nil && s.client.AheadRead != nil {
+					s.aheadReadWindow = NewAheadReadWindow(s.client.AheadRead, s)
+				}
+				bgTime := stat.BeginStat()
+				readBytes, err = s.aheadRead(req, storageClass)
 				if err == nil && readBytes == req.Size {
+					stat.EndStat("ReadFromMem", err, bgTime, 1)
 					total += readBytes
 					continue
 				}
@@ -247,7 +295,7 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 				s.inode, req, s.client.bcacheEnable, s.client.bcacheOnlyForNotSSD, s.needBCache)
 			if s.client.bcacheEnable && s.needBCache && filesize <= bcache.MaxFileSize {
 				cacheKey := util.GenerateRepVolKey(s.client.volumeName, s.inode, req.ExtentKey.PartitionId, req.ExtentKey.ExtentId, req.ExtentKey.FileOffset)
-				inodeInfo, err := s.client.getInodeInfo(s.inode)
+				inodeInfo, err = s.client.getInodeInfo(s.inode)
 				if err != nil {
 					log.LogErrorf("Streamer read: getInodeInfo failed. ino(%v) req(%v) err(%v)", s.inode, req, err)
 					return 0, err
@@ -264,44 +312,50 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 							total += req.Size
 							bcacheMetric := exporter.NewCounter("fileReadL1CacheHit")
 							bcacheMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
-							log.LogDebugf("TRACE Stream read. hit blockCache: cacheKey(%v) inode(%v) "+
-								"offset(%v) readBytes(%v) goroutine(%v)", cacheKey, s.inode, offset, readBytes, getGoid())
+							if log.EnableDebug() {
+								log.LogDebugf("TRACE Stream read. hit blockCache: cacheKey(%v) inode(%v) "+
+									"offset(%v) readBytes(%v) goroutine(%v)", cacheKey, s.inode, offset, readBytes, getGoid())
+							}
 							continue
 						}
 						bcacheMissMetric := exporter.NewCounter("fileReadL1CacheMiss")
+
 						bcacheMissMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
 					}
-					log.LogDebugf("TRACE Stream read. miss blockCache cacheKey(%v) inode(%v) offset(%v) size(%v)"+
-						"goroutine(%v)", cacheKey, s.inode, offset, req.Size, getGoid())
+					if log.EnableDebug() {
+						log.LogDebugf("TRACE Stream read. miss blockCache cacheKey(%v) inode(%v) offset(%v) size(%v)"+
+							"goroutine(%v)", cacheKey, s.inode, offset, req.Size, getGoid())
+					}
 				} else {
 					log.LogDebugf("Streamer not read from bcache, ino(%v) storageClass(%v) s.client.bcacheEnable(%v) bcacheOnlyForNotSSD(%v)",
 						s.inode, proto.StorageClassString(inodeInfo.StorageClass), s.client.bcacheEnable, s.client.bcacheOnlyForNotSSD)
 				}
 				log.LogDebugf("TRACE Stream read. miss blockCache cacheKey(%v) loadBcache(%v)", cacheKey, s.client.loadBcache)
 			} else if s.enableRemoteCache() {
-				inodeInfo, err := s.client.getInodeInfo(s.inode)
+				inodeInfo, err = s.client.getInodeInfo(s.inode)
 				if err != nil {
 					log.LogErrorf("Streamer read: getInodeInfo failed. ino(%v) req(%v) err(%v)", s.inode, req, err)
 					return 0, err
 				}
 
 				if s.client.forceRemoteCache || !s.client.RemoteCache.remoteCacheOnlyForNotSSD || (s.client.RemoteCache.remoteCacheOnlyForNotSSD && inodeInfo.StorageClass != proto.StorageClass_Replica_SSD) {
-					log.LogDebugf("Streamer read from remoteCache, ino(%v) enableRemoteCache(true) storageClass(%v) remoteCacheOnlyForNotSSD(%v) forceRemoteCache(%v)",
-						s.inode, proto.StorageClassString(inodeInfo.StorageClass), s.client.RemoteCache.remoteCacheOnlyForNotSSD, s.client.forceRemoteCache)
-					var cacheReadRequests []*CacheReadRequest
-					cacheReadRequests, err = s.prepareCacheRequests(uint64(offset), uint64(size), data, inodeInfo.Generation)
+					log.LogDebugf("Streamer read from remoteCache, ino(%v) enableRemoteCache(true) storageClass(%v) remoteCacheOnlyForNotSSD(%v)",
+						s.inode, proto.StorageClassString(inodeInfo.StorageClass), s.client.RemoteCache.remoteCacheOnlyForNotSSD)
+					var cacheReadRequests []*remotecache.CacheReadRequest
+					cacheReadRequests, err = s.prepareCacheRequests(uint64(req.FileOffset), uint64(req.Size), req.Data, inodeInfo.Generation)
 					if err == nil {
 						var read int
 						remoteCacheMetric := exporter.NewCounter("readRemoteCache")
 						remoteCacheMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
-						if read, err = s.readFromRemoteCache(ctx, uint64(offset), uint64(size), cacheReadRequests); err == nil {
+						if read, err = s.readFromRemoteCache(ctx, uint64(req.FileOffset), uint64(req.Size), cacheReadRequests); err == nil {
 							remoteCacheHitMetric := exporter.NewCounter("readRemoteCacheHit")
 							remoteCacheHitMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
-							return read, err
+							total += read
+							continue
 						}
 					}
 					if !proto.IsFlashNodeLimitError(err) {
-						log.LogWarnf("Stream read: readFromRemoteCache failed: ino(%v) offset(%v) size(%v), err(%v)", s.inode, offset, size, err)
+						log.LogWarnf("Stream read: readFromRemoteCache failed: ino(%v) offset(%v) size(%v), err(%v)", s.inode, req.FileOffset, req.Size, err)
 					}
 				} else {
 					log.LogDebugf("Streamer not read from remoteCache, ino(%v) enableRemoteCache(true) storageClass(%v) remoteCacheOnlyForNotSSD(%v)",
@@ -319,7 +373,7 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 			}
 
 			if s.client.bcacheEnable && s.needBCache && filesize <= bcache.MaxFileSize {
-				inodeInfo, err := s.client.getInodeInfo(s.inode)
+				inodeInfo, err = s.client.getInodeInfo(s.inode)
 				if err != nil {
 					log.LogErrorf("Streamer read: getInodeInfo failed. ino(%v) req(%v) err(%v)", s.inode, req, err)
 					return 0, err
@@ -331,21 +385,25 @@ func (s *Streamer) read(data []byte, offset int, size int, storageClass uint32) 
 				} else if !s.client.bcacheOnlyForNotSSD || (s.client.bcacheOnlyForNotSSD && inodeInfo.StorageClass != proto.StorageClass_Replica_SSD) {
 					select {
 					case s.pendingCache <- bcacheKey{cacheKey: cacheKey, extentKey: req.ExtentKey}:
-						log.LogDebugf("action[streamer.read] blockCache send cacheKey %v for ino(%v) offset %v size %v goroutine(%v)",
-							cacheKey, s.inode, req.FileOffset-int(req.ExtentKey.FileOffset), req.Size, getGoid())
+						if log.EnableDebug() {
+							log.LogDebugf("action[streamer.read] blockCache send cacheKey %v for ino(%v) offset %v size %v goroutine(%v)",
+								cacheKey, s.inode, req.FileOffset-int(req.ExtentKey.FileOffset), req.Size, getGoid())
+						}
 						if s.exceedBlockSize(req.ExtentKey.Size) {
 							atomic.AddInt32(&s.client.inflightL1BigBlock, 1)
 						}
 					default:
-						log.LogDebugf("action[streamer.read] blockCache discard cacheKey %v for ino(%v) offset %v size %v  goroutine(%v)",
-							cacheKey, s.inode, req.FileOffset-int(req.ExtentKey.FileOffset), req.Size, getGoid())
+						if log.EnableDebug() {
+							log.LogDebugf("action[streamer.read] blockCache discard cacheKey %v for ino(%v) offset %v size %v  goroutine(%v)",
+								cacheKey, s.inode, req.FileOffset-int(req.ExtentKey.FileOffset), req.Size, getGoid())
+						}
 					}
 				}
 			}
 			bgTime := stat.BeginStat()
 			readBytes, err = reader.Read(req)
 			stat.EndStat("ReadFromDataNode", err, bgTime, 1)
-			log.LogDebugf("TRACE Stream read: ino(%v) req(%v) readBytes(%v) err(%v)", s.inode, req, readBytes, err)
+			log.LogDebugf("TRACE Stream read: ino(%v) req(%v) readBytes(%v) err(%v) cost(%v)", s.inode, req, readBytes, err, time.Since(*bgTime))
 
 			total += readBytes
 
@@ -436,4 +494,320 @@ func getGoid() int {
 
 func (s *Streamer) UpdateStringPath(fullPath string) {
 	s.fullPath = fullPath
+}
+
+// asyncFlushManager manages asynchronous flush operations using channel-based producer-consumer pattern
+func (s *Streamer) asyncFlushManager() {
+	log.LogDebugf("asyncFlushManager:  started for streamer(%v)", s)
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.asyncFlushDone:
+			log.LogDebugf("asyncFlushManager:  stopped for streamer(%v)", s)
+			return
+		case req, ok := <-s.asyncFlushCh:
+			if !ok {
+				// Channel is closed, exit the manager
+				log.LogDebugf("asyncFlushManager:  asyncFlushCh closed, stopping asyncFlushManager for streamer(%v)", s)
+				return
+			}
+			if req == nil {
+				continue
+			}
+			// Check if we should stop processing new requests
+			select {
+			case <-s.asyncFlushDone:
+				log.LogDebugf("asyncFlushManager: received stop signal, skipping request for handler(%v)", req.handler)
+				// Streamer is being released, fail the request
+				req.done <- errors.New("streamer is being released")
+				continue
+			default:
+				// Continue processing
+			}
+			log.LogDebugf("asyncFlushManager: try processAsyncFlushRequest handler(%v)", req.handler)
+			// Process the async flush request with semaphore to limit concurrent executions
+			shouldBreak := false
+			for {
+				select {
+				case s.asyncFlushSemaphore <- struct{}{}:
+					go func() {
+						defer func() { <-s.asyncFlushSemaphore }()
+						s.processAsyncFlushRequest(req)
+					}()
+					shouldBreak = true
+					break
+				default:
+					time.Sleep(time.Millisecond)
+					log.LogDebugf("asyncFlushManager: handler(%v) asyncFlushSemaphore is full", req.handler)
+				}
+				if shouldBreak {
+					break
+				}
+			}
+		case <-t.C:
+			if s.rdonly {
+				log.LogDebugf("rdonly stream no need to start asyncFlushManager routine. ino %d", s.inode)
+				return
+			}
+			if !s.isOpen && len(s.asyncFlushCh) == 0 {
+				log.LogDebugf("asyncFlushManager  is done for streamer(%v)  closed", s.inode)
+				return
+			}
+		}
+	}
+}
+
+// processAsyncFlushRequest processes a single async flush request
+func (s *Streamer) processAsyncFlushRequest(req *AsyncFlushRequest) {
+	// Add to wait group to track this operation
+	s.asyncFlushWg.Add(1)
+	defer s.asyncFlushWg.Done()
+
+	handler := req.handler
+	log.LogDebugf("processAsyncFlushRequest:start  handler id %v", handler.id)
+	// Note: asyncFlushDone check is now handled in asyncFlushManager
+	// to prevent new requests from being processed when streamer is being released
+
+	// Check if inflight count has decreased (packets completed)
+	currentInflight := atomic.LoadInt32(&handler.inflight)
+	if currentInflight == 0 {
+		log.LogDebugf("processAsyncFlushRequest: handler %v currentInflight == 0 ", handler)
+		// All packets completed, process extent keys
+		go s.completeAsyncFlush(req)
+		return
+	}
+
+	// Re-queue for next check
+	select {
+	case s.asyncFlushCh <- req:
+		// Successfully re-queued
+		log.LogDebugf("processAsyncFlushRequest:re-queued  handler %v", handler)
+	default:
+		log.LogDebugf("processAsyncFlushRequest: completeAsyncFlush handler %v", handler)
+		// Channel is full or closed, process immediately
+		go s.completeAsyncFlush(req)
+	}
+}
+
+// completeAsyncFlush completes an async flush operation
+func (s *Streamer) completeAsyncFlush(req *AsyncFlushRequest) {
+	// Add to wait group to track this operation
+	s.asyncFlushWg.Add(1)
+	defer func() {
+		s.asyncFlushWg.Done()
+	}()
+
+	handler := req.handler
+	log.LogDebugf("completeAsyncFlush: streamer(%v) eh(%v) start", s.inode, handler)
+	nextReq := s.getNextPendingAsyncFlush()
+	if nextReq == nil {
+		log.LogWarnf("completeAsyncFlush: No pending async flush requests found for streamer(%v) handler(%v)",
+			s.inode, handler)
+		req.done <- errors.New("no pending async flush requests")
+		return
+	}
+	if nextReq.handler.id > handler.id {
+		log.LogWarnf("completeAsyncFlush: streamer(%v) handler(%v) is skipped, nextReq(%v)",
+			s.inode, handler, nextReq.handler.id)
+		req.done <- nil
+		return
+	}
+	if nextReq.handler.id < handler.id {
+		log.LogDebugf("completeAsyncFlush: streamer(%v) eh(%v) id(%v) is not next in sequence (next: %v), waiting...",
+			s.inode, handler, handler.id, nextReq.handler.id)
+		// Wait for the correct request to be processed
+		// This is a simple polling approach - in a production system, you might want to use channels or condition variables
+		for {
+			select {
+			case s.asyncFlushCh <- req:
+				// Successfully re-queued
+				log.LogDebugf("completeAsyncFlush:re-queued  handler %v", handler)
+				return
+			default:
+				nextReq = s.getNextPendingAsyncFlush()
+				if nextReq == nil {
+					log.LogErrorf("completeAsyncFlush: No pending async flush requests found while waiting for "+
+						"streamer(%v) handler(%v)", s.inode, handler)
+					req.done <- errors.New("no pending async flush requests")
+					return
+				}
+				if nextReq.handler.id >= handler.id {
+					goto end
+				}
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}
+end:
+	err := handler.flush()
+	if err != nil {
+		log.LogWarnf("completeAsyncFlush: completed failed for handler(%v)", handler)
+	} else {
+		log.LogDebugf("completeAsyncFlush: completed successfully for handler(%v) err(%v)", handler, err)
+		if req.clearFunc != nil {
+			req.clearFunc()
+		}
+	}
+	req.done <- err
+}
+
+// requestAsyncFlush initiates an asynchronous flush for a handler
+func (s *Streamer) requestAsyncFlush(handler *ExtentHandler, clearFunc func()) chan error {
+	log.LogDebugf("requestAsyncFlush handler %v", handler)
+
+	// Check if this handler already has an active async flush request
+	if s.isHandlerFlushActive(handler.id) {
+		existingReq := s.getActiveHandlerFlush(handler.id)
+		if existingReq != nil {
+			log.LogDebugf("Handler %v already has active async flush request, returning existing", handler.id)
+			return existingReq.done
+		}
+	}
+
+	req := &AsyncFlushRequest{
+		handler:   handler,
+		done:      make(chan error, 1),
+		clearFunc: clearFunc,
+	}
+
+	// Add to pending map using handler.id as key (both for sequencing and duplicate prevention)
+	s.addPendingAsyncFlush(handler.id, req)
+
+	// Check if asyncFlushCh is closed before sending
+	select {
+	case <-s.asyncFlushDone:
+		// Streamer is being released, fail the request immediately
+		log.LogWarnf("requestAsyncFlush: streamer is being released, failing request for handler(%v)", handler)
+		req.done <- errors.New("streamer is being released")
+		return req.done
+	default:
+		// Continue with normal processing
+	}
+
+	// Send to channel (non-blocking)
+	select {
+	case s.asyncFlushCh <- req:
+		log.LogDebugf("Requested async flush for handler(%v) inflight(%v)",
+			handler, atomic.LoadInt32(&handler.inflight))
+	default:
+		// Channel is full, process immediately
+		log.LogWarnf("Async flush channel full, processing immediately for handler(%v)", handler)
+		go s.completeAsyncFlush(req)
+	}
+
+	return req.done
+}
+
+// isHandlerFlushActive checks if a handler already has an active async flush request
+func (s *Streamer) isHandlerFlushActive(handlerID uint64) bool {
+	_, exists := s.pendingAsyncFlushMap.Load(handlerID)
+	return exists
+}
+
+// getActiveHandlerFlush returns the active request for a handler
+func (s *Streamer) getActiveHandlerFlush(handlerID uint64) *AsyncFlushRequest {
+	if value, exists := s.pendingAsyncFlushMap.Load(handlerID); exists {
+		return value.(*AsyncFlushRequest)
+	}
+	return nil
+}
+
+// addPendingAsyncFlush adds a request to the pending map using handler.id as key
+func (s *Streamer) addPendingAsyncFlush(handlerID uint64, req *AsyncFlushRequest) {
+	s.pendingAsyncFlushMap.Store(handlerID, req)
+	if log.EnableDebug() {
+		log.LogDebugf("addPendingAsyncFlush:  streamer(%v) handler(%v)  trace(%v)", s.inode, handlerID, string(debug.Stack()))
+	}
+}
+
+// removePendingAsyncFlush removes a request from the pending map
+func (s *Streamer) removePendingAsyncFlush(handlerID uint64) {
+	s.pendingAsyncFlushMap.Delete(handlerID)
+	if log.EnableDebug() {
+		log.LogDebugf("removePendingAsyncFlush  streamer(%v)  handler(%v) trace(%v)", s.inode, handlerID, string(debug.Stack()))
+	}
+}
+
+// getPendingRequestsCount returns the number of pending requests
+func (s *Streamer) getPendingRequests() []uint64 {
+	ids := make([]uint64, 0)
+	s.pendingAsyncFlushMap.Range(func(key, value interface{}) bool {
+		ids = append(ids, value.(*AsyncFlushRequest).handler.id)
+		return true
+	})
+	return ids
+}
+
+// waitForAllAsyncFlushRequests waits for all async flush requests to be processed
+// Returns true if all requests were processed successfully, false if timeout
+func (s *Streamer) waitForAllAsyncFlushRequests() bool {
+	checkInterval := 10 * time.Millisecond // Check every 10ms
+	bgTime := stat.BeginStat()
+	defer func() {
+		stat.EndStat("waitForAllAsyncFlushRequests", nil, bgTime, 1)
+	}()
+	start := time.Now()
+	for {
+		// Check if all requests are processed
+		pendingReqs := s.getPendingRequests()
+		channelLen := len(s.asyncFlushCh)
+		dirtyListLen := s.dirtylist.Len()
+
+		if atomic.LoadInt32(&s.status) >= StreamerError {
+			log.LogErrorf("streamer(%v) is error status, skip waitForAllAsyncFlushRequests", s.inode)
+			return true
+		}
+		if len(pendingReqs) == 0 && channelLen == 0 {
+			return true
+		}
+		// Wait before next check
+		time.Sleep(checkInterval)
+		if timeutil.GetCurrentTime().Sub(start) > time.Minute*2 {
+			start = time.Now()
+			log.LogErrorf("Timeout Wait for streamer(%v), pending: %d, channel: %d channelLen: %d",
+				s.inode, pendingReqs, channelLen, dirtyListLen)
+		}
+	}
+}
+
+// Write protection functions
+func (s *Streamer) startWriteProtection(handler *ExtentHandler) {
+	s.writeProtectionLock.Lock()
+	defer s.writeProtectionLock.Unlock()
+	s.writeInProgress = true
+	s.writeHandler = handler
+	log.LogDebugf("Write protection started for handler(%v) in streamer(%v)", handler, s.inode)
+}
+
+func (s *Streamer) endWriteProtection() {
+	s.writeProtectionLock.Lock()
+	defer s.writeProtectionLock.Unlock()
+	s.writeInProgress = false
+	s.writeHandler = nil
+	log.LogDebugf("Write protection ended for streamer(%v)", s.inode)
+}
+
+func (s *Streamer) isHandlerProtected(handler *ExtentHandler) bool {
+	s.writeProtectionLock.Lock()
+	defer s.writeProtectionLock.Unlock()
+	return s.writeInProgress && s.writeHandler == handler
+}
+
+// getNextPendingAsyncFlush returns the next pending request that should be processed
+func (s *Streamer) getNextPendingAsyncFlush() *AsyncFlushRequest {
+	var oldestHandlerID uint64 = ^uint64(0) // Max uint64
+	var oldestReq *AsyncFlushRequest
+
+	s.pendingAsyncFlushMap.Range(func(key, value interface{}) bool {
+		handlerID := key.(uint64)
+		req := value.(*AsyncFlushRequest)
+		if handlerID < oldestHandlerID {
+			oldestHandlerID = handlerID
+			oldestReq = req
+		}
+		return true // continue iteration
+	})
+
+	return oldestReq
 }

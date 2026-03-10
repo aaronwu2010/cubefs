@@ -21,7 +21,9 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,6 +99,10 @@ var gSt *Statistic = nil
 
 func NewStatistic(dir, logModule string, logMaxSize int64, timeOutUs [MaxTimeoutLevel]uint32, useMutex bool) (*Statistic, error) {
 	dir = path.Join(dir, logModule)
+	// normalize to absolute path to avoid cwd-related issues
+	if absDir, err := filepath.Abs(dir); err == nil {
+		dir = absDir
+	}
 	fi, err := os.Stat(dir)
 	if err != nil {
 		os.MkdirAll(dir, 0o755)
@@ -211,7 +217,17 @@ func EndStat(typeName string, err error, bgTime *time.Time, statCount uint32) er
 	}
 
 	if err != nil {
-		newErrStr := string(re.ReplaceAll([]byte(err.Error()), []byte("(xxx)")))
+		var newErrStr string
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.LogErrorf("EndStat panic: err(%v) stack(%v)", r, string(debug.Stack()))
+					newErrStr = "unknown_error"
+				}
+			}()
+			newErrStr = string(re.ReplaceAll([]byte(err.Error()), []byte("(xxx)")))
+		}()
+
 		baseLen := len(typeName) + 2
 		if len(newErrStr)+baseLen > 41 {
 			typeName = typeName + "[" + newErrStr[:41-baseLen] + "]"
@@ -256,6 +272,12 @@ func WriteStat() error {
 	}
 	if PrintModuleStat != nil {
 		PrintModuleStat(ioStream)
+	}
+	mem, ok1 := gSt.typeInfoMap["ReadFromMem"]
+	read, ok2 := gSt.typeInfoMap["Read"]
+	if ok1 && ok2 {
+		rate := float64(mem.allCount) / float64(read.allCount)
+		fmt.Fprintf(ioStream, "AheadReadHitRate %.2f%%\n", rate*100)
 	}
 	fmt.Fprintf(ioStream, "%-42s|%10s|%8s|%8s|%8s|%8s|%8s|%8s|%8s|\n",
 		"", "TOTAL", "FAILED", "AVG(ms)", "MAX(ms)", "MIN(ms)",
@@ -462,4 +484,21 @@ func GetAvgLatencyMs(typeName string) float32 {
 		avgUs = int32(typeInfo.allTimeUs / time.Duration(typeInfo.allCount))
 	}
 	return float32(avgUs) / 1000
+}
+
+func GetCount(typeName string) uint32 {
+	if gSt == nil {
+		return 0
+	}
+
+	if gSt.useMutex {
+		gSt.Lock()
+		defer gSt.Unlock()
+	}
+
+	typeInfo := gSt.typeInfoMap[typeName]
+	if typeInfo == nil {
+		return 0
+	}
+	return typeInfo.allCount
 }

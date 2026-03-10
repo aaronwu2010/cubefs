@@ -425,7 +425,7 @@ func (w *Wrapper) updateDataPartitionByRsp(forceUpdate bool, refreshPolicy Refre
 		if w.followerRead && w.nearRead {
 			dp.NearHosts = w.sortHostsByDistance(dp.Hosts)
 		}
-		log.LogInfof("[updateDataPartitionByRsp]: dp(%v)", dp)
+		// log.LogInfof("[updateDataPartitionByRsp]: dp(%v)", dp)
 		w.replaceOrInsertPartition(dp)
 
 		if dp.MediaType == proto.MediaType_SSD {
@@ -437,8 +437,8 @@ func (w *Wrapper) updateDataPartitionByRsp(forceUpdate bool, refreshPolicy Refre
 		if dp.Status == proto.ReadWrite {
 			dp.MetricsRefresh()
 			rwPartitionGroups = append(rwPartitionGroups, dp)
-			log.LogInfof("updateDataPartition: dpId(%v) mediaType(%v) address(%p) insert to rwPartitionGroups",
-				dp.PartitionID, proto.MediaTypeString(dp.MediaType), dp)
+			// log.LogInfof("updateDataPartition: dpId(%v) mediaType(%v) address(%p) insert to rwPartitionGroups",
+			//	dp.PartitionID, proto.MediaTypeString(dp.MediaType), dp)
 			if dp.MediaType == proto.MediaType_SSD {
 				ssdDpWritableCount += 1
 			} else if dp.MediaType == proto.MediaType_HDD {
@@ -561,19 +561,16 @@ func (w *Wrapper) replaceOrInsertPartition(dp *DataPartition) {
 	old, ok := w.partitions[dp.PartitionID]
 	if ok {
 		oldstatus = old.Status
-
 		old.Status = dp.Status
 		old.ReplicaNum = dp.ReplicaNum
 		old.Hosts = dp.Hosts
 		old.IsDiscard = dp.IsDiscard
 		old.NearHosts = dp.NearHosts
-
 		dp.Metrics = old.Metrics
 	} else {
 		dp.Metrics = NewDataPartitionMetrics()
-		w.partitions[dp.PartitionID] = dp
 	}
-
+	w.partitions[dp.PartitionID] = dp
 	w.Lock.Unlock()
 
 	if ok && oldstatus != dp.Status {

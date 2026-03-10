@@ -45,6 +45,7 @@ type LimiterStatus struct {
 	IOQueue       int
 	IORunning     int
 	IOWaiting     int
+	IOHanging     int
 	Factor        int
 }
 
@@ -143,6 +144,16 @@ func (l *IoLimiter) TryRunAsync(ctx context.Context, size int, waitForFlow bool,
 	}
 	if ok := l.getIO().TryRun(taskFn, true); !ok {
 		return LimitedRunError
+	}
+	return nil
+}
+
+func (l *IoLimiter) AcquireDiskFlow(size int) error {
+	if size > 0 && l.limit > 0 {
+		if err := l.flow.WaitN(context.Background(), size); err != nil {
+			log.LogWarnf("action[limitio] get disk flow token wait flow with %d %s", size, err.Error())
+			return err
+		}
 	}
 	return nil
 }
@@ -327,6 +338,7 @@ func (q *ioQueue) Status() (st LimiterStatus) {
 	st.IOQueue = cap(q.queue)
 	st.IORunning = int(atomic.LoadUint32(&q.running))
 	st.IOWaiting = len(q.queue)
+	st.IOHanging = len(q.midQueue)
 	st.Factor = q.factor
 	return
 }

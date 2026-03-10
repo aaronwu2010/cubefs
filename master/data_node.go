@@ -70,12 +70,15 @@ type DataNode struct {
 	QosIopsWLimit                      uint64
 	QosFlowRLimit                      uint64
 	QosFlowWLimit                      uint64
+	BalancedDiskUsage                  uint64
+	BalancedDPCount                    uint64
 	DecommissionStatus                 uint32
 	DecommissionDstAddr                string
 	DecommissionRaftForce              bool
 	DecommissionLimit                  int
 	DecommissionWeight                 int
 	DecommissionFirstHostParallelLimit uint64
+	DecommissionTime                   uint64
 	DecommissionCompleteTime           int64
 	DpCntLimit                         uint64             `json:"-"` // max count of data partition in a data node
 	CpuUtil                            atomicutil.Float64 `json:"-"`
@@ -637,7 +640,7 @@ func (dataNode *DataNode) updateDecommissionStatus(c *Cluster, debug, persist bo
 	if successDiskNum+failedDiskNum+cancelDiskNum == totalDisk {
 		if successDiskNum == totalDisk {
 			if persist {
-				dataNode.SetDecommissionStatus(DecommissionSuccess)
+				dataNode.markDecommissionSuccess(c)
 			}
 			return DecommissionSuccess, float64(1)
 		}
@@ -649,7 +652,7 @@ func (dataNode *DataNode) updateDecommissionStatus(c *Cluster, debug, persist bo
 			}
 		} else {
 			if persist {
-				dataNode.SetDecommissionStatus(DecommissionFail)
+				dataNode.markDecommissionFail()
 			} else {
 				return DecommissionFail, progress / float64(totalDisk)
 			}
@@ -658,7 +661,7 @@ func (dataNode *DataNode) updateDecommissionStatus(c *Cluster, debug, persist bo
 	return dataNode.GetDecommissionStatus(), progress / float64(totalDisk)
 }
 
-func (dataNode *DataNode) GetLatestDecommissionDataPartition(c *Cluster) (partitions []*DataPartition) {
+func (dataNode *DataNode) GetLatestDecommissionDataPartition(c *Cluster) (remainingDpCnt int, partitions []*DataPartition) {
 	log.LogDebugf("action[GetLatestDecommissionDataPartition]dataNode %v diskList %v", dataNode.Addr, dataNode.DecommissionDiskList)
 	for _, disk := range dataNode.DecommissionDiskList {
 		key := fmt.Sprintf("%s_%s", dataNode.Addr, disk)
@@ -673,6 +676,11 @@ func (dataNode *DataNode) GetLatestDecommissionDataPartition(c *Cluster) (partit
 			}
 			log.LogDebugf("action[GetLatestDecommissionDataPartition]dataNode %v disk %v dps[%v]",
 				dataNode.Addr, dd.DiskPath, dpIds)
+			if dd.GetDecommissionStatus() == markDecommission {
+				remainingDpCnt += dd.GetDecommissionTotalDpCnt(c)
+			} else {
+				remainingDpCnt += len(dps)
+			}
 		}
 	}
 	return
@@ -686,12 +694,12 @@ func (dataNode *DataNode) SetDecommissionStatus(status uint32) {
 	atomic.StoreUint32(&dataNode.DecommissionStatus, status)
 }
 
-func (dataNode *DataNode) GetDecommissionFailedAndRunningDPByTerm(c *Cluster) ([]proto.FailedDpInfo, []uint64) {
+func (dataNode *DataNode) GetDecommissionFailedAndRunningDPByTerm(c *Cluster) (int, []proto.FailedDpInfo, []uint64) {
 	var (
 		failedDps  []proto.FailedDpInfo
 		runningDps []uint64
 	)
-	partitions := dataNode.GetLatestDecommissionDataPartition(c)
+	remainingDpCnt, partitions := dataNode.GetLatestDecommissionDataPartition(c)
 	log.LogDebugf("action[GetDecommissionDataNodeFailedDP] partitions len %v", len(partitions))
 	for _, dp := range partitions {
 		if dp.IsRollbackFailed() {
@@ -703,7 +711,7 @@ func (dataNode *DataNode) GetDecommissionFailedAndRunningDPByTerm(c *Cluster) ([
 		}
 	}
 	log.LogWarnf("action[GetDecommissionDataNodeFailedDP] failed dp list [%v]", failedDps)
-	return failedDps, runningDps
+	return remainingDpCnt, failedDps, runningDps
 }
 
 func (dataNode *DataNode) GetDecommissionFailedDP(c *Cluster) (error, []uint64) {
@@ -729,6 +737,7 @@ func (dataNode *DataNode) markDecommission(targetAddr string, raftForce bool, li
 	dataNode.DecommissionLimit = limit
 	dataNode.DecommissionWeight = weight
 	dataNode.DecommissionDiskList = make([]string, 0)
+	dataNode.DecommissionTime = uint64(time.Now().Unix())
 }
 
 func (dataNode *DataNode) markDecommissionSuccess(c *Cluster) {
@@ -743,6 +752,10 @@ func (dataNode *DataNode) markDecommissionSuccess(c *Cluster) {
 
 func (dataNode *DataNode) markDecommissionFail() {
 	dataNode.SetDecommissionStatus(DecommissionFail)
+	// if only decommission part of data partitions, can alloc dp in future
+	if dataNode.DecommissionLimit != 0 {
+		dataNode.ToBeOffline = false
+	}
 	// dataNode.ToBeOffline = false
 	// dataNode.DecommissionCompleteTime = time.Now().Unix()
 }

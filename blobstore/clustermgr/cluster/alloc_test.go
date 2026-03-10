@@ -24,18 +24,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cubefs/cubefs/blobstore/api/shardnode"
 	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
-	"github.com/cubefs/cubefs/blobstore/clustermgr/mock"
+	"github.com/cubefs/cubefs/blobstore/api/shardnode"
 	"github.com/cubefs/cubefs/blobstore/clustermgr/persistence/normaldb"
 	"github.com/cubefs/cubefs/blobstore/common/codemode"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
+	mock "github.com/cubefs/cubefs/blobstore/testing/mockclustermgr"
 	"github.com/cubefs/cubefs/blobstore/testing/mocks"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
 )
@@ -50,6 +50,7 @@ var testDiskMgrConfig = DiskMgrConfig{
 	ChunkSize:                17179869184, // 16G
 	CodeModes:                []codemode.CodeMode{codemode.EC15P12, codemode.EC6P6},
 	ChunkOversoldRatio:       0.5,
+	ReservedSpace:            1 << 28,
 	CopySetConfigs:           make(map[proto.DiskType]CopySetConfig),
 }
 
@@ -69,7 +70,7 @@ var (
 	defaultRetrySleepIntervalS time.Duration = 2
 	testMockScopeMgr           *mock.MockScopeMgrAPI
 	testMockBlobNode           *mocks.MockStorageAPI
-	testMockShardNode          *MockShardNodeAPI
+	testMockShardNode          *mock.MockShardNodeAPI
 	testIdcs                   = []string{"z0", "z1", "z2"}
 	hostPrefix                 = "test-host-"
 )
@@ -182,6 +183,43 @@ func initTestDiskMgrDisksWithReadonly(t *testing.T, testDiskMgr *BlobNodeManager
 	}
 }
 
+func initTestBlobNodeMgrDisksWithOverSold(t *testing.T, testDiskMgr *BlobNodeManager, start, end int, specifyNodeID bool, idcs ...string) {
+	_, ctx := trace.StartSpanFromContext(context.Background(), "")
+	diskInfo := clustermgr.BlobNodeDiskInfo{
+		DiskHeartBeatInfo: clustermgr.DiskHeartBeatInfo{
+			Used:                 0,
+			Size:                 16 * 1024 * 1024 * 1024 * 1024,
+			Free:                 16 * 1024 * 1024 * 1024 * 1024,
+			MaxChunkCnt:          16 * 1024 / 16,
+			FreeChunkCnt:         16 * 1024 / 16,
+			OversoldFreeChunkCnt: 20 * 1024 / 16,
+		},
+		DiskInfo: clustermgr.DiskInfo{
+			ClusterID: proto.ClusterID(1),
+			Idc:       "z0",
+			Status:    proto.DiskStatusNormal,
+			Readonly:  false,
+		},
+	}
+	for idx, idc := range idcs {
+		for i := start; i <= end; i++ {
+			diskInfo.DiskID = proto.DiskID(idx*10000 + i)
+			hostID := i/60 + 1
+			if specifyNodeID {
+				hostID = i
+			}
+			diskInfo.NodeID = proto.NodeID(idx*10000 + hostID)
+			diskInfo.Rack = strconv.Itoa(hostID)
+			diskInfo.Host = idc + hostPrefix + strconv.Itoa(hostID)
+			diskInfo.Idc = idc
+
+			newDiskInfo := diskInfo
+			err := testDiskMgr.applyAddDisk(ctx, &newDiskInfo)
+			require.NoError(t, err)
+		}
+	}
+}
+
 func initTestBlobNodeMgrNodes(t *testing.T, testDiskMgr *BlobNodeManager, start, end int, idcs ...string) {
 	_, ctx := trace.StartSpanFromContext(context.Background(), "")
 	nodeInfo := clustermgr.NodeInfo{
@@ -227,7 +265,7 @@ func initTestShardNodeMgr(t *testing.T) (d *ShardNodeManager, closeFunc func()) 
 	if err != nil {
 		t.Log(errors.Detail(err))
 	}
-	testMockShardNode = NewMockShardNodeAPI(ctrl)
+	testMockShardNode = mock.NewMockShardNodeAPI(ctrl)
 	testMockRaftServer := mocks.NewMockRaftServer(ctrl)
 	testMockRaftServer.EXPECT().Propose(gomock.Any(), gomock.Any()).AnyTimes().Return(nil)
 

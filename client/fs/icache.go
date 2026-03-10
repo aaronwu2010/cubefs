@@ -36,21 +36,27 @@ const (
 // InodeCache defines the structure of the inode cache.
 type InodeCache struct {
 	sync.RWMutex
-	cache       map[uint64]*list.Element
-	lruList     *list.List
-	expiration  time.Duration
-	maxElements int
+	cache        map[uint64]*list.Element
+	lruList      *list.List
+	expiration   time.Duration
+	maxElements  int
+	initExp      time.Duration
+	acceleration bool
 }
 
 // NewInodeCache returns a new inode cache.
-func NewInodeCache(exp time.Duration, maxElements int) *InodeCache {
+func NewInodeCache(exp time.Duration, maxElements int, acceleration bool) *InodeCache {
 	ic := &InodeCache{
-		cache:       make(map[uint64]*list.Element),
-		lruList:     list.New(),
-		expiration:  exp,
-		maxElements: maxElements,
+		cache:        make(map[uint64]*list.Element),
+		lruList:      list.New(),
+		expiration:   exp,
+		maxElements:  maxElements,
+		initExp:      exp,
+		acceleration: acceleration,
 	}
-	go ic.backgroundEviction()
+	if !acceleration {
+		go ic.backgroundEviction()
+	}
 	return ic
 }
 
@@ -71,8 +77,8 @@ func (ic *InodeCache) Put(info *proto.InodeInfo) {
 	element := ic.lruList.PushFront(info)
 	ic.cache[info.Inode] = element
 	ic.Unlock()
-	log.LogDebugf("InodeCache put inode: inode(%v) expire(%v)",
-		info.Inode, info.Expiration())
+	log.LogDebugf("InodeCache put inode: inode(%v) expire(%v), hasExtents(%v)",
+		info.Inode, info.Expiration(), info.HasExtents())
 }
 
 // Get returns the inode info based on the given inode number.
@@ -86,7 +92,7 @@ func (ic *InodeCache) Get(ino uint64) *proto.InodeInfo {
 	}
 
 	info := element.Value.(*proto.InodeInfo)
-	if inodeExpired(info) && DisableMetaCache {
+	if inodeExpired(info) && DisableMetaCache && !ic.acceleration {
 		ic.RUnlock()
 		log.LogDebugf("Inode Cache %v expired", ino)
 		return nil
@@ -94,15 +100,20 @@ func (ic *InodeCache) Get(ino uint64) *proto.InodeInfo {
 	ic.RUnlock()
 
 	if info != nil {
-		log.LogDebugf("Inode Cache found ino(%v) storageClass(%v)",
-			ino, info.StorageClass)
+		log.LogDebugf("Inode Cache found ino(%v) storageClass(%v), expiration(%v)",
+			ino, info.StorageClass, info.Expiration())
+	}
+	if ic.acceleration && info != nil {
+		info.SetExpiration(time.Now().Add(ic.expiration).UnixNano())
 	}
 	return info
 }
 
 // Delete deletes the inode info based on the given inode number.
 func (ic *InodeCache) Delete(ino uint64) {
-	log.LogDebugf("InodeCache Delete: ino(%v)", ino)
+	if log.EnableDebug() {
+		log.LogDebugf("InodeCache Delete: ino(%v)", ino)
+	}
 	ic.Lock()
 	element, ok := ic.cache[ino]
 	if ok {
@@ -181,4 +192,15 @@ func (ic *InodeCache) backgroundEviction() {
 		elapsed := time.Since(start)
 		log.LogInfof("InodeCache: total inode cache(%d), cost(%d)ns", ic.lruList.Len(), elapsed.Nanoseconds())
 	}
+}
+
+func (ic *InodeCache) ChangeExpiration(exp time.Duration) {
+	if ic.expiration != exp {
+		log.LogInfof("ChangeExpiration from %v to %v", ic.expiration, exp)
+		ic.expiration = exp
+	}
+}
+
+func (ic *InodeCache) RecoverExpiration() {
+	ic.ChangeExpiration(ic.initExp)
 }

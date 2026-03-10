@@ -155,6 +155,12 @@ const (
 	quotaClass                             = "quotaClass"
 	quotaOfClass                           = "quotaOfStorageClass"
 	dataMediaTypeKey                       = "dataMediaType"
+	dataNodeBalanceOnKey                   = "dataNodeBalanceOn"
+	dataNodeBalanceIntervalKey             = "dataNodeBalanceInterval"
+	dataNodeBalanceByDiskUsageHighKey      = "dataNodeBalanceByDiskUsageHigh"
+	dataNodeBalanceByDiskUsageLowKey       = "dataNodeBalanceByDiskUsageLow"
+	dataNodeBalanceByDPCountHighKey        = "dataNodeBalanceByDPCountHigh"
+	dataNodeBalanceByDPCountLowKey         = "dataNodeBalanceByDPCountLow"
 
 	remoteCacheEnable            = "remoteCacheEnable"
 	remoteCacheAutoPrepare       = "remoteCacheAutoPrepare"
@@ -267,7 +273,6 @@ const (
 	metaNodesUnAvailable = 2
 	dataNodesUnAvailable = 3
 
-	unusedFlashNodeFlashGroupID = 0
 	defaultFlashGroupSlotsCount = 32
 	RsvEmptyMetaPartitionCnt    = 2
 	WaitForClientUpdateTimeMin  = 10

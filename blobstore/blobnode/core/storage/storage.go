@@ -23,6 +23,7 @@ import (
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
+	"github.com/cubefs/cubefs/blobstore/blobnode/base"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core"
 	bloberr "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
@@ -115,6 +116,10 @@ func (stg *storage) NewRangeReader(ctx context.Context, b *core.Shard, from, to 
 	return rc, nil
 }
 
+func (stg *storage) NewBatchReader(ctx context.Context, bs *core.BatchShard) (rc core.WriteToCloser, err error) {
+	return stg.data.BatchRead(ctx, bs)
+}
+
 func (stg *storage) MarkDelete(ctx context.Context, bid proto.BlobID) (err error) {
 	meta := stg.meta
 
@@ -144,7 +149,11 @@ func (stg *storage) Delete(ctx context.Context, bid proto.BlobID) (n int64, err 
 
 	shardMeta, err := meta.Read(ctx, bid)
 	if err != nil {
-		span.Errorf("Failed: shard:%v read err:%v", bid, err)
+		if base.IsShardDeleted(err) {
+			span.Warnf("Failed: shard:%v read err:%v", bid, err)
+		} else {
+			span.Errorf("Failed: shard:%v read err:%v", bid, err)
+		}
 		return n, err
 	}
 
@@ -160,9 +169,9 @@ func (stg *storage) Delete(ctx context.Context, bid proto.BlobID) (n int64, err 
 		return n, err
 	}
 
-	// data inline , skip
-	if shardMeta.Inline {
-		return int64(shardMeta.Size), nil
+	// inline and nopdata has no actual data in disk
+	if shardMeta.Inline || shardMeta.NopData {
+		return 0, nil
 	}
 
 	shard := &core.Shard{

@@ -26,10 +26,11 @@ import (
 
 // ExtentRequest defines the struct for the request of read or write an extent.
 type ExtentRequest struct {
-	FileOffset int
-	Size       int
-	Data       []byte
-	ExtentKey  *proto.ExtentKey
+	FileOffset  int
+	Size        int
+	Data        []byte
+	ExtentKey   *proto.ExtentKey
+	CreateNewEk bool
 }
 
 // String returns the string format of the extent request.
@@ -247,7 +248,7 @@ func (cache *ExtentCache) SplitExtentKey(inodeID uint64, ekPivot *proto.ExtentKe
 
 // Append appends an extent key.
 func (cache *ExtentCache) Append(ek *proto.ExtentKey, sync bool) (discardExtents []proto.ExtentKey) {
-	log.LogDebugf("action[ExtentCache.Append] ek %v", ek)
+	log.LogDebugf("ExtentCache Append:ino(%v) new ek %v sync %v", cache.inode, ek, sync)
 	ekEnd := ek.FileOffset + uint64(ek.Size)
 	lower := &proto.ExtentKey{FileOffset: ek.FileOffset}
 	upper := &proto.ExtentKey{FileOffset: ekEnd}
@@ -268,17 +269,18 @@ func (cache *ExtentCache) Append(ek *proto.ExtentKey, sync bool) (discardExtents
 	cache.root.AscendRange(lower, upper, func(i btree.Item) bool {
 		found := i.(*proto.ExtentKey)
 		discard = append(discard, found)
+		log.LogDebugf("ExtentCache Append: ino(%v) add discard ek(%v) for new ek(%v)", cache.inode, discard, ek)
 		return true
 	})
 
 	// After deleting the data between lower and upper, we will do the append
 	for _, key := range discard {
 		cache.root.Delete(key)
-		log.LogDebugf("ExtentCache del: ino(%v) ek(%v) ", cache.inode, key)
+		log.LogDebugf("ExtentCache Append: ino(%v) del discard ek(%v) for new ek(%v)", cache.inode, key, ek)
 		if key.PartitionId != 0 && key.ExtentId != 0 && (key.PartitionId != ek.PartitionId || key.ExtentId != ek.ExtentId || ek.ExtentOffset != key.ExtentOffset) {
 			if sync || (ek.PartitionId == 0 && ek.ExtentId == 0) {
 				cache.discard.ReplaceOrInsert(key)
-				// log.LogDebugf("ExtentCache Append add to discard: ino(%v) ek(%v) discard(%v)", cache.inode, ek, key)
+				log.LogDebugf("ExtentCache Append: ino(%v) add to discard  ek(%v) discard(%v)", cache.inode, ek, key)
 			}
 		}
 	}
@@ -457,8 +459,8 @@ func (cache *ExtentCache) PrepareReadRequests(offset, size int, data []byte) []*
 		ekStart := int(ek.FileOffset)
 		ekEnd := int(ek.FileOffset) + int(ek.Size)
 
-		log.LogDebugf("PrepareReadRequests: req[ino(%v) start(%v) end(%v)] ek[extentID(%v),FileOffset(Start(%v) End(%v))]",
-			cache.inode, start, end, ek.ExtentId, ekStart, ekEnd)
+		// log.LogDebugf("PrepareReadRequests: req[ino(%v) start(%v) end(%v)] ek[extentID(%v),FileOffset(Start(%v) End(%v))]",
+		//	cache.inode, start, end, ek.ExtentId, ekStart, ekEnd)
 
 		if start < ekStart {
 			if end <= ekStart {
@@ -531,7 +533,7 @@ func (cache *ExtentCache) PrepareWriteRequests(offset, size int, data []byte) []
 		log.LogDebugf("action[ExtentCache.PrepareWriteRequests] ek [%v], pivot[%v]", ek, pivot)
 		return false
 	})
-
+	createNewExtentKey := false
 	cache.root.AscendRange(lower, upper, func(i btree.Item) bool {
 		ek := i.(*proto.ExtentKey)
 		ekStart := int(ek.FileOffset)
@@ -555,6 +557,8 @@ func (cache *ExtentCache) PrepareWriteRequests(offset, size int, data []byte) []
 				start = end
 				return false
 			} else {
+				// create new extentKey if end >= ekEnd
+				createNewExtentKey = true
 				return true
 			}
 		} else if start < ekEnd {
@@ -580,6 +584,9 @@ func (cache *ExtentCache) PrepareWriteRequests(offset, size int, data []byte) []
 	if start < end {
 		// add hole (start, end)
 		req := NewExtentRequest(start, end-start, data[start-offset:end-offset], nil)
+		if createNewExtentKey {
+			req.CreateNewEk = true
+		}
 		requests = append(requests, req)
 	}
 

@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	syslog "log"
@@ -35,12 +36,13 @@ import (
 	"github.com/cubefs/cubefs/cmd/common"
 	"github.com/cubefs/cubefs/console"
 	"github.com/cubefs/cubefs/datanode"
-	"github.com/cubefs/cubefs/flashnode"
 	"github.com/cubefs/cubefs/lcnode"
 	"github.com/cubefs/cubefs/master"
 	"github.com/cubefs/cubefs/metanode"
 	"github.com/cubefs/cubefs/objectnode"
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/remotecache/flashgroupmanager"
+	"github.com/cubefs/cubefs/remotecache/flashnode"
 	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/cubefs/cubefs/util/config"
 	"github.com/cubefs/cubefs/util/errors"
@@ -67,25 +69,27 @@ const (
 )
 
 const (
-	RoleMaster    = "master"
-	RoleMeta      = "metanode"
-	RoleData      = "datanode"
-	RoleAuth      = "authnode"
-	RoleObject    = "objectnode"
-	RoleConsole   = "console"
-	RoleLifeCycle = "lcnode"
-	RoleFlash     = "flashnode"
+	RoleMaster            = "master"
+	RoleMeta              = "metanode"
+	RoleData              = "datanode"
+	RoleAuth              = "authnode"
+	RoleObject            = "objectnode"
+	RoleConsole           = "console"
+	RoleLifeCycle         = "lcnode"
+	RoleFlash             = "flashnode"
+	RoleFlashGroupManager = "flashgroupmanager"
 )
 
 const (
-	ModuleMaster    = "master"
-	ModuleMeta      = "metaNode"
-	ModuleData      = "dataNode"
-	ModuleAuth      = "authNode"
-	ModuleObject    = "objectNode"
-	ModuleConsole   = "console"
-	ModuleLifeCycle = "lcnode"
-	ModuleFlash     = "flashNode"
+	ModuleMaster            = "master"
+	ModuleMeta              = "metaNode"
+	ModuleData              = "dataNode"
+	ModuleAuth              = "authNode"
+	ModuleObject            = "objectNode"
+	ModuleConsole           = "console"
+	ModuleLifeCycle         = "lcnode"
+	ModuleFlash             = "flashNode"
+	ModuleFlashGroupManager = "flashGroupManager"
 )
 
 const (
@@ -222,8 +226,11 @@ func main() {
 		server = lcnode.NewServer()
 		module = ModuleLifeCycle
 	case RoleFlash:
-		server = flashnode.NewServer()
+		server = flashnode.NewFlashNode()
 		module = ModuleFlash
+	case RoleFlashGroupManager:
+		server = flashgroupmanager.NewFlashGroupManager()
+		module = ModuleFlashGroupManager
 	default:
 		err = errors.NewErrorf("Fatal: role mismatch: %s", role)
 		fmt.Println(err)
@@ -398,6 +405,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	http.HandleFunc("/healthyz", liveCheck)
+	http.HandleFunc("/livez", liveCheck)
+	http.HandleFunc("/readyz", readyCheck)
+
 	daemonize.SignalOutcome(nil)
 
 	// Block main goroutine until server shutdown.
@@ -431,4 +442,33 @@ func startDaemon() error {
 	}
 
 	return nil
+}
+
+func writeJSONResponse(w http.ResponseWriter, status string, message string) {
+	resp := map[string]interface{}{
+		"status":  status,
+		"message": message,
+		"time":    time.Now().Format(time.RFC3339),
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.LogErrorf("failed to encode response, err %s", err.Error())
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
+func liveCheck(w http.ResponseWriter, r *http.Request) {
+	log.LogInfof("livez check request received")
+	writeJSONResponse(w, "livez", "service is running")
+	log.LogInfo("livez check response sent successfully")
+}
+
+func readyCheck(w http.ResponseWriter, r *http.Request) {
+	log.LogInfof("ready check request received")
+	writeJSONResponse(w, "ready", "service is ready")
+	log.LogInfo("ready check response sent successfully")
 }

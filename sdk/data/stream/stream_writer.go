@@ -23,6 +23,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/cubefs/cubefs/datanode/storage"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/wrapper"
@@ -47,7 +49,19 @@ const (
 const (
 	streamWriterFlushPeriod       = 3
 	streamWriterIdleTimeoutPeriod = 10
+	// Async flush constants
+	asyncFlushQueueSize     = 128 // Buffer size for async flush channel
+	asyncFlushSemaphoreSize = 4   // Capacity of semaphore to limit concurrent processAsyncFlushRequest executions
 )
+
+// Note: asyncFlushSequencer is now per-streamer to avoid global lock contention
+
+// AsyncFlushRequest represents an asynchronous flush request
+type AsyncFlushRequest struct {
+	handler   *ExtentHandler
+	done      chan error
+	clearFunc func() // Function to execute cleanup operations
+}
 
 // VerUpdateRequest defines an verseq update request.
 type VerUpdateRequest struct {
@@ -214,6 +228,19 @@ func (s *Streamer) server() {
 			s.traversed = 0
 		case <-s.done:
 			s.abort()
+			// Clean up async flush system
+			select {
+			case <-s.asyncFlushDone:
+				// Channel already closed, do nothing
+			default:
+				close(s.asyncFlushDone)
+			}
+			select {
+			case <-s.asyncFlushCh:
+				// Channel already closed, do nothing
+			default:
+				close(s.asyncFlushCh) // Close the channel to signal asyncFlushManager to stop
+			}
 			log.LogDebugf("done server: evict, streamer(%v)", s)
 			return
 		case <-t.C:
@@ -228,7 +255,7 @@ func (s *Streamer) server() {
 					if s.client.disableMetaCache || !s.needBCache {
 						log.LogDebugf("done server: delete streamer(%v)", s)
 						delete(s.client.streamers, s.inode)
-						if s.client.evictIcache != nil {
+						if s.client.evictIcache != nil && s.openForWrite {
 							s.client.evictIcache(s.inode)
 						}
 					}
@@ -294,7 +321,7 @@ func (s *Streamer) abortRequest(request interface{}) {
 
 func (s *Streamer) handleRequest(request interface{}) {
 	if atomic.LoadInt32(&s.needUpdateVer) == 1 {
-		s.closeOpenHandler()
+		s.closeOpenHandler(true)
 		atomic.StoreInt32(&s.needUpdateVer, 0)
 	}
 
@@ -310,7 +337,7 @@ func (s *Streamer) handleRequest(request interface{}) {
 		request.err = s.truncate(request.size, request.fullPath)
 		request.done <- struct{}{}
 	case *FlushRequest:
-		request.err = s.flush()
+		request.err = s.flush(true, uuid.New().String())
 		request.done <- struct{}{}
 	case *ReleaseRequest:
 		request.err = s.release()
@@ -339,9 +366,9 @@ func (s *Streamer) write(data []byte, offset, size, flags int, checkFunc func() 
 		direct = true
 	}
 begin:
+	fileSize, _ := s.extents.Size()
 	if flags&proto.FlagsAppend != 0 {
-		filesize, _ := s.extents.Size()
-		offset = filesize
+		offset = fileSize
 	}
 
 	log.LogDebugf("Streamer write enter: ino(%v) offset(%v) size(%v) flags(%v) storageClass(%v) isMigration(%v)",
@@ -352,22 +379,27 @@ begin:
 	s.client.LimitManager.WriteAlloc(ctx, size)
 
 	requests := s.extents.PrepareWriteRequests(offset, size, data)
-	log.LogDebugf("Streamer write: ino(%v) prepared requests(%v)", s.inode, requests)
+	// requests contain offset
+	log.LogDebugf("Streamer write: ino(%v) prepared requests(%v) offset(%v) fileSize(%v)", s.inode, requests, offset, fileSize)
 
 	isChecked := false
 	// Must flush before doing overwrite
 	for _, req := range requests {
-		if req.ExtentKey == nil {
+		// if offset < fileSize, client should wait for all the async flush requests
+		// to complete
+		if !s.waitForFlush && req.ExtentKey == nil && !req.CreateNewEk {
 			continue
 		}
-		err = s.flush()
+
+		err = s.flush(true, uuid.New().String())
 		if err != nil {
 			return
 		}
 		// some extent key in requests with partition id 0 means it's append operation and on flight.
 		// need to flush and get the right key then used to make modification
 		requests = s.extents.PrepareWriteRequests(offset, size, data)
-		log.LogDebugf("Streamer write: ino(%v) prepared requests after flush(%v)", s.inode, requests)
+		log.LogDebugf("Streamer write: ino(%v) prepared requests after flush(%v) offset(%v) fileSize(%v)",
+			s.inode, requests, offset, fileSize)
 		break
 	}
 
@@ -409,7 +441,7 @@ begin:
 				log.LogDebugf("action[streamer.write] ino %v doOverWriteByAppend extent key (%v)", s.inode, req.ExtentKey)
 				writeSize, _, err, _ = s.doOverWriteByAppend(req, direct, storageClass, isMigration)
 			}
-			if s.aheadReadEnable {
+			if s.aheadReadEnable && s.aheadReadWindow != nil && s.aheadReadWindow.cache != nil {
 				s.aheadReadWindow.evictCacheBlock(req)
 			}
 			if s.client.bcacheEnable {
@@ -462,7 +494,7 @@ func (s *Streamer) doDirectWriteByAppend(req *ExtentRequest, direct bool, op uin
 	)
 
 	log.LogDebugf("action[doDirectWriteByAppend] inode %v enter in req %v", s.inode, req)
-	err = s.flush()
+	err = s.flush(true, uuid.New().String())
 	if err != nil {
 		return
 	}
@@ -627,7 +659,7 @@ func (s *Streamer) doDirectWriteByAppend(req *ExtentRequest, direct bool, op uin
 func (s *Streamer) doOverwrite(req *ExtentRequest, direct bool, storageClass uint32) (total int, err error) {
 	var dp *wrapper.DataPartition
 
-	err = s.flush()
+	err = s.flush(true, uuid.New().String())
 	if err != nil {
 		return
 	}
@@ -636,11 +668,16 @@ func (s *Streamer) doOverwrite(req *ExtentRequest, direct bool, storageClass uin
 	// remote cache.Even if the random write fails, it won't cause the
 	// remote cache to fail to cache the latest data.
 	if s.enableRemoteCache() {
+		// During LTP testing, it was observed that when performing overwrite writes,
+		// the local file size is altered by metaNode from concurrent client reads,
+		// causing the user-visible metadata to become inconsistent with the expected
+		// actual file size. To prevent remote data from updating the local metadata,
+		// the client increments the generation number (gen) in advance.
+		s.extents.gen++
 		err = s.client.metaWrapper.UpdateInodeMeta(s.inode)
 		if err != nil {
 			return
 		}
-		s.extents.gen++
 	}
 
 	offset := req.FileOffset
@@ -751,7 +788,8 @@ func (s *Streamer) doOverwrite(req *ExtentRequest, direct bool, storageClass uin
 func (s *Streamer) tryInitExtentHandlerByLastEk(offset, size int, isMigration bool) (isLastEkVerNotEqual bool) {
 	storeMode := s.GetStoreMod(offset, size)
 	getEndEkFunc := func() *proto.ExtentKey {
-		if ek := s.extents.GetEndForAppendWrite(uint64(offset), s.verSeq, false); ek != nil && !storage.IsTinyExtent(ek.ExtentId) {
+		if ek := s.extents.GetEndForAppendWrite(uint64(offset), s.verSeq, false); ek != nil &&
+			!storage.IsTinyExtent(ek.ExtentId) && ek.PartitionId != 0 {
 			return ek
 		}
 		return nil
@@ -761,7 +799,7 @@ func (s *Streamer) tryInitExtentHandlerByLastEk(offset, size int, isMigration bo
 		if currentEK.GetSeq() != s.verSeq {
 			log.LogDebugf("tryInitExtentHandlerByLastEk. exist ek seq %v vs request seq %v", currentEK.GetSeq(), s.verSeq)
 			if int(currentEK.ExtentOffset)+int(currentEK.Size)+size > util.ExtentSize {
-				s.closeOpenHandler()
+				s.closeOpenHandler(true)
 				return
 			}
 			isLastEkVerNotEqual = true
@@ -770,15 +808,15 @@ func (s *Streamer) tryInitExtentHandlerByLastEk(offset, size int, isMigration bo
 
 	initExtentHandlerFunc := func(currentEK *proto.ExtentKey) {
 		checkVerFunc(currentEK)
-		log.LogDebugf("tryInitExtentHandlerByLastEk: found ek in ExtentCache, extent_id(%v) req_offset(%v) req_size(%v), currentEK [%v] streamer seq %v",
-			currentEK.ExtentId, offset, size, currentEK, s.verSeq)
+		log.LogDebugf("tryInitExtentHandlerByLastEk: ino(%v) found ek in ExtentCache, extent_id(%v) req_offset(%v) req_size(%v), currentEK [%v] streamer seq %v",
+			s.inode, currentEK.ExtentId, offset, size, currentEK, s.verSeq)
 		dp, pidErr := s.client.dataWrapper.GetDataPartition(currentEK.PartitionId)
 		if pidErr == nil {
 			seq := currentEK.GetSeq()
 			if isLastEkVerNotEqual {
 				seq = s.verSeq
 			}
-			log.LogDebugf("tryInitExtentHandlerByLastEk NewExtentHandler")
+			log.LogDebugf("tryInitExtentHandlerByLastEk  ino(%v) NewExtentHandler", s.inode)
 			handler := NewExtentHandler(s, int(currentEK.FileOffset), storeMode, int(currentEK.Size), dp.MediaType, isMigration)
 			handler.key = &proto.ExtentKey{
 				FileOffset:   currentEK.FileOffset,
@@ -793,22 +831,22 @@ func (s *Streamer) tryInitExtentHandlerByLastEk(offset, size int, isMigration bo
 			handler.lastKey = *currentEK
 
 			if s.handler != nil {
-				log.LogDebugf("tryInitExtentHandlerByLastEk: close old handler, currentEK.PartitionId(%v)",
-					currentEK.PartitionId)
-				s.closeOpenHandler()
+				log.LogDebugf("tryInitExtentHandlerByLastEk:  ino(%v) close old handler, currentEK.PartitionId(%v)",
+					s.inode, currentEK.PartitionId)
+				s.closeOpenHandler(true)
 			}
 
 			s.handler = handler
 			s.dirty = false
-			log.LogDebugf("tryInitExtentHandlerByLastEk: currentEK.PartitionId(%v) found", currentEK.PartitionId)
+			log.LogDebugf("tryInitExtentHandlerByLastEk:  ino(%v) currentEK.PartitionId(%v) found", s.inode, currentEK.PartitionId)
 		} else {
-			log.LogDebugf("tryInitExtentHandlerByLastEk: currentEK.PartitionId(%v) not found", currentEK.PartitionId)
+			log.LogDebugf("tryInitExtentHandlerByLastEk:  ino(%v) currentEK.PartitionId(%v) not found", s.inode, currentEK.PartitionId)
 		}
 	}
 
 	if storeMode == proto.NormalExtentType {
 		if s.handler == nil {
-			log.LogDebugf("tryInitExtentHandlerByLastEk: handler nil")
+			log.LogDebugf("tryInitExtentHandlerByLastEk: ino(%v) handler nil", s.inode)
 			if ek := getEndEkFunc(); ek != nil {
 				initExtentHandlerFunc(ek)
 			}
@@ -874,21 +912,44 @@ func (s *Streamer) doWriteAppendEx(data []byte, offset, size int, direct bool, r
 				return
 			}
 		} else if s.handler != nil {
-			s.closeOpenHandler()
+			// Close handler synchronously to avoid race conditions
+			err = s.closeOpenHandler(true)
+			if err != nil {
+				log.LogErrorf("doWriteAppendEx: closeOpenHandler failed, ino(%v) err(%v)", s.inode, err)
+				return
+			}
+			s.handler = nil
 		}
 
 		for i := 0; i < MaxNewHandlerRetry; i++ {
+			// Start write protection for this handler
 			if s.handler == nil {
 				s.handler = NewExtentHandler(s, offset, storeMode, 0, storageClass, isMigration)
+				log.LogDebugf("doWriteAppendEx: ino(%v) offset(%v) size(%v), new handler(%v)",
+					s.inode, offset, size, s.handler)
 				s.dirty = false
 			} else if s.handler.storeMode != storeMode {
 				// store mode changed, so close open handler and start a new one
-				err = s.closeOpenHandler()
+				log.LogDebugf("doWriteAppendEx: ino(%v) offset(%v) size(%v), closeOpenHandler handler(%v)",
+					s.inode, offset, size, s.handler)
+				err = s.closeOpenHandler(true) // Use synchronous close
 				if err != nil {
+					log.LogErrorf("doWriteAppendEx: closeOpenHandler failed during store mode change, ino(%v) err(%v)", s.inode, err)
 					break
 				}
+				s.handler = nil
 				continue
 			}
+
+			// Check if handler is still valid before writing
+			if s.handler == nil {
+				log.LogErrorf("doWriteAppendEx: handler is nil after creation, ino(%v)", s.inode)
+				err = errors.New("handler is nil after creation")
+				break
+			}
+
+			log.LogDebugf("doWriteAppendEx: handler(%v) offset(%v) size(%v)",
+				s.handler, offset, size)
 			ek, err = s.handler.write(data, offset, size, direct)
 			if err == nil && ek != nil {
 				ek.SetSeq(s.verSeq)
@@ -896,29 +957,47 @@ func (s *Streamer) doWriteAppendEx(data []byte, offset, size int, direct bool, r
 					s.dirtylist.Put(s.handler)
 					s.dirty = true
 				}
+				log.LogDebugf("doWriteAppendEx: handler write success ino(%v) offset(%v) size(%v) "+
+					"storeMode(%v) handler(%v)", s.inode, offset, size, storeMode, s.handler)
 				break
 			}
-
-			log.LogDebugf("doWrite handler write failed so close open handler: ino(%v) offset(%v) size(%v) storeMode(%v) err(%v)",
-				s.inode, offset, size, storeMode, err)
-
-			err = s.closeOpenHandler()
+			log.LogDebugf("doWrite handler write failed so close open handler: ino(%v) offset(%v) size(%v) "+
+				"storeMode(%v) handler(%v) err(%v)",
+				s.inode, offset, size, storeMode, s.handler, err)
+			err = s.closeOpenHandler(false)
 			if err != nil {
+				log.LogErrorf("doWriteAppendEx: closeOpenHandler failed after write error, ino(%v) err(%v)", s.inode, err)
 				break
 			}
+			s.handler = nil
 		}
 	} else {
+		log.LogDebugf("doWriteAppendEx: start write protection, handler(%v)", s.handler)
 		s.handler = NewExtentHandler(s, offset, storeMode, 0, storageClass, isMigration)
 		s.dirty = false
-		ek, err = s.handler.write(data, offset, size, direct)
-		if err == nil && ek != nil {
-			if !s.dirty {
-				s.dirtylist.Put(s.handler)
-				s.dirty = true
+
+		// Check if handler is still valid before writing
+		if s.handler == nil {
+			log.LogErrorf("doWriteAppendEx: handler is nil after creation (non-hot path), ino(%v)", s.inode)
+			err = errors.New("handler is nil after creation")
+		} else {
+			ek, err = s.handler.write(data, offset, size, direct)
+			if err == nil && ek != nil {
+				if !s.dirty {
+					s.dirtylist.Put(s.handler)
+					s.dirty = true
+				}
 			}
 		}
 
-		err = s.closeOpenHandler()
+		// Close handler synchronously
+		closeErr := s.closeOpenHandler(true)
+		if closeErr != nil {
+			log.LogErrorf("doWriteAppendEx: closeOpenHandler failed (non-hot path), ino(%v) err(%v)", s.inode, closeErr)
+			if err == nil {
+				err = closeErr
+			}
+		}
 	}
 
 	if err != nil || ek == nil {
@@ -933,7 +1012,9 @@ func (s *Streamer) doWriteAppendEx(data []byte, offset, size int, direct bool, r
 	return
 }
 
-func (s *Streamer) flush() (err error) {
+func (s *Streamer) flushAsync(wait bool, id string) (err error) {
+	pending := make(map[*ExtentHandler]chan error)
+	asyncExtentHandler := make([]*ExtentHandler, 0)
 	for {
 		element := s.dirtylist.Get()
 		if element == nil {
@@ -941,22 +1022,85 @@ func (s *Streamer) flush() (err error) {
 		}
 		eh := element.Value.(*ExtentHandler)
 
-		log.LogDebugf("Streamer flush begin: eh(%v)", eh)
-		err = eh.flush()
-		if err != nil {
-			log.LogErrorf("Streamer flush failed: eh(%v)", eh)
-			return
+		clearFunc := func() {
+			if eh.getStatus() == ExtentStatusOpen {
+				s.dirty = false
+			} else {
+				eh.cleanup()
+			}
 		}
-		eh.stream.dirtylist.Remove(element)
-		if eh.getStatus() == ExtentStatusOpen {
-			s.dirty = false
-			log.LogDebugf("Streamer flush handler open: eh(%v)", eh)
+		log.LogDebugf("Streamer(%v) flush begin: eh(%v) id(%v)", s.inode, eh, id)
+
+		// Use async flush for better performance if enabled
+		if s.client.enableAsyncFlush {
+			// If there are in-flight packets, use async flush
+			log.LogDebugf("Streamer(%v) flush using async flush for eh(%v) with inflight(%v) id(%v) wait(%v)",
+				s.inode, eh, atomic.LoadInt32(&eh.inflight), id, wait)
+			ch := s.requestAsyncFlush(eh, clearFunc)
+			if wait {
+				if _, ok := pending[eh]; !ok {
+					pending[eh] = ch
+				}
+			} else {
+				asyncExtentHandler = append(asyncExtentHandler, eh)
+			}
+			eh.stream.dirtylist.Remove(element)
 		} else {
-			// TODO unhandled error
-			eh.cleanup()
-			log.LogDebugf("Streamer flush handler cleaned up: eh(%v)", eh)
+			// No in-flight packets or async flush disabled, use synchronous flush
+			start := time.Now()
+			err = eh.flush()
+			log.LogDebugf("Streamer(%v) flush using  flush for eh(%v) with inflight(%v) id(%v) wait(%v) cost(%v)",
+				s.inode, eh, atomic.LoadInt32(&eh.inflight), id, wait, time.Since(start).String())
+			// do not block waitForAllAsyncFlushRequests for abort operation
+			s.removePendingAsyncFlush(eh.id)
+			if err != nil {
+				log.LogErrorf("Streamer flush failed: eh(%v) err(%v)", eh, err)
+				return
+			}
+			log.LogDebugf("remove eh(%v) from dirtyList id(%v) ", eh, id)
+			eh.stream.dirtylist.Remove(element)
+			clearFunc()
 		}
-		log.LogDebugf("Streamer flush end: eh(%v)", eh)
+	}
+	if !s.client.enableAsyncFlush {
+		return
+	}
+	log.LogDebugf("Streamer(%v) wait(%v) pending(%v) id(%v)", s.inode, wait, pending, id)
+	if wait {
+		var firstErr error
+		for len(pending) > 0 {
+			progressed := false
+			for eh, ch := range pending {
+				select {
+				case e := <-ch:
+					s.removePendingAsyncFlush(eh.id)
+					delete(pending, eh)
+					if e != nil && firstErr == nil {
+						firstErr = e
+					}
+					if e != nil {
+						eh.cleanup()
+					}
+					progressed = true
+				default:
+					// not ready, keep in pending
+				}
+			}
+			if !progressed {
+				time.Sleep(time.Millisecond * 1)
+			}
+		}
+		if firstErr != nil {
+			return firstErr
+		}
+		// may trigger recoveryHandler, so flush again
+		if s.dirtylist.Len() != 0 {
+			return s.flush(wait, id)
+		}
+	} else {
+		for _, eh := range asyncExtentHandler {
+			s.dirtylist.Put(eh)
+		}
 	}
 	return
 }
@@ -989,7 +1133,9 @@ func (s *Streamer) traverse() (err error) {
 				}
 				return
 			}
+			log.LogDebugf("remove eh(%v) from dirtyList", eh)
 			s.dirtylist.Remove(element)
+			s.removePendingAsyncFlush(eh.id)
 			eh.cleanup()
 		} else {
 			if s.traversed < streamWriterFlushPeriod {
@@ -1007,31 +1153,46 @@ func (s *Streamer) traverse() (err error) {
 
 // note: The invocation of the closeOpenHandler function on an inode is serialized
 // close open handler, then flush data
-func (s *Streamer) closeOpenHandler() (err error) {
-	log.LogDebugf("closeOpenHandler: streamer(%v)", s)
-	defer func() {
-		log.LogDebugf("closeOpenHandler: close success, stream(%v)", s)
-	}()
-
+func (s *Streamer) closeOpenHandler(wait bool) (err error) {
+	id := uuid.New().String()
 	handler := s.handler
+	log.LogDebugf("closeOpenHandler: streamer(%v) with eh(%v) wait (%v) id(%v)", s.inode, handler, wait, id)
+	defer func() {
+		log.LogDebugf("closeOpenHandler: close success, stream(%v) with eh(%v) wait (%v) id(%v)", s.inode, handler, wait, id)
+	}()
 	if handler != nil {
-		log.LogDebugf("closeOpenHandler: flush open handler now, eh(%v)", handler)
-		err = handler.flush()
-		if err != nil {
-			log.LogErrorf("closeOpenHandler: eh(%v) flush failed, err %s", handler, err.Error())
-			return
-		}
+		log.LogDebugf("closeOpenHandler: flush open handler now, eh(%v) id(%v)", handler, id)
 
-		handler.setClosed()
-		if !s.dirty {
-			// in case the current handler is not on the dirty list and will not get cleaned up
-			log.LogDebugf("closeOpenHandler need cleanup: eh(%v)", s.handler)
-			s.handler.cleanup()
+		cleanFunc := func(h *ExtentHandler) func() {
+			return func() {
+				h.setClosed()
+				// cleanup eh when flush is completed
+				h.cleanup()
+			}
+		}(handler)
+
+		// Use async flush if async flush is enabled
+		// directIO use sync flush
+		if s.client.enableAsyncFlush && !s.waitForFlush {
+			log.LogDebugf("closeOpenHandler: using async flush for handler(%v) with inflight(%v) id(%v)",
+				handler, atomic.LoadInt32(&handler.inflight), id)
+			s.requestAsyncFlush(handler, cleanFunc)
+			s.dirtylist.Put(handler)
+		} else {
+			log.LogDebugf("closeOpenHandler: try flush (%v)id(%v)", handler, id)
+			err = handler.flush()
+			if err != nil {
+				log.LogErrorf("closeOpenHandler: eh(%v) flush failed, err %s id(%v)", handler, err.Error(), id)
+				return
+			}
+			cleanFunc()
 		}
-		s.handler = nil
 	}
-
-	err = s.flush()
+	// For synchronous operations, it's safe to set handler to nil immediately
+	s.handler = nil
+	log.LogDebugf("closeOpenHandler: streamer(%v) wait for wait (%v) id(%v)", s.inode, wait, id)
+	err = s.flush(wait, id)
+	log.LogDebugf("closeOpenHandler: streamer(%v) wait (%v) id(%v) end err(%v)", s.inode, wait, id, err)
 	if err != nil {
 		log.LogErrorf("closeOpenHandler: flush extent failed, err %s", err.Error())
 		return err
@@ -1051,7 +1212,7 @@ func (s *Streamer) release() error {
 	if s.client.AheadRead != nil {
 		s.aheadReadEnable = s.client.AheadRead.enable
 	}
-	err := s.closeOpenHandler()
+	err := s.closeOpenHandler(true)
 	if err != nil {
 		s.abort()
 	}
@@ -1069,17 +1230,74 @@ func (s *Streamer) evict() error {
 		delete(s.client.streamers, s.inode)
 	}
 	s.client.streamerLock.Unlock()
+
+	// Wait for all async flush operations to complete before closing channels
+	log.LogDebugf("evict: waiting for async flush operations to complete for streamer(%v)", s)
+	s.asyncFlushWg.Wait()
+	log.LogDebugf("evict: all async flush operations completed for streamer(%v)", s)
+
+	// Wait for all async flush requests to be processed
+	// Use a reasonable timeout to avoid hanging indefinitely
+	if !s.waitForAllAsyncFlushRequests() {
+		log.LogWarnf("Async flush timeout during evict for streamer(%v), some requests may be lost", s.inode)
+	}
+
+	// Signal async flush operations to stop accepting new requests
+	select {
+	case <-s.asyncFlushDone:
+		// Channel already closed, do nothing
+	default:
+		close(s.asyncFlushDone)
+	}
+
+	// Now safe to close the async flush channel
+	select {
+	case <-s.asyncFlushCh:
+		// Channel already closed, do nothing
+	default:
+		close(s.asyncFlushCh)
+	}
+
 	return nil
 }
 
 func (s *Streamer) abort() {
+	// Wait for all async flush operations to complete
+	log.LogDebugf("abort: waiting for async flush operations to complete for streamer(%v)", s)
+	s.asyncFlushWg.Wait()
+	log.LogDebugf("abort: all async flush operations completed for streamer(%v)", s)
+
+	// Wait for all async flush requests to be processed
+	// Use a reasonable timeout to avoid hanging indefinitely
+	if !s.waitForAllAsyncFlushRequests() {
+		log.LogWarnf("Async flush timeout during abort for streamer(%v), some requests may be lost", s.inode)
+	}
+
+	// Signal async flush operations to stop accepting new requests
+	select {
+	case <-s.asyncFlushDone:
+		// Channel already closed, do nothing
+	default:
+		close(s.asyncFlushDone)
+	}
+
+	// Now safe to close the async flush channel
+	select {
+	case <-s.asyncFlushCh:
+		// Channel already closed, do nothing
+	default:
+		close(s.asyncFlushCh)
+	}
+
 	for {
 		element := s.dirtylist.Get()
 		if element == nil {
 			break
 		}
 		eh := element.Value.(*ExtentHandler)
+		log.LogDebugf("remove eh(%v) from dirtyList", eh)
 		s.dirtylist.Remove(element)
+		s.removePendingAsyncFlush(eh.id)
 		// TODO unhandled error
 		eh.cleanup()
 		log.LogDebugf("abort cleanup: eh(%v)", s.handler)
@@ -1090,9 +1308,13 @@ func (s *Streamer) truncate(size int, fullPath string) error {
 	if atomic.LoadInt32(&s.status) >= StreamerError {
 		return errors.New(fmt.Sprintf("IssueWriteRequest: stream writer in error status, ino(%v)", s.inode))
 	}
-	err := s.closeOpenHandler()
+	err := s.closeOpenHandler(true)
 	if err != nil {
 		return err
+	}
+
+	if s.aheadReadEnable && s.aheadReadWindow != nil {
+		s.aheadReadWindow.evictAllBlocks()
 	}
 
 	err = s.client.truncate(s.inode, uint64(size), fullPath)
@@ -1126,4 +1348,43 @@ func (s *Streamer) tinySizeLimit() int {
 
 func (s *Streamer) setError() {
 	atomic.StoreInt32(&s.status, StreamerError)
+}
+
+func (s *Streamer) flushSync() (err error) {
+	for {
+		element := s.dirtylist.Get()
+		if element == nil {
+			break
+		}
+		eh := element.Value.(*ExtentHandler)
+
+		log.LogDebugf("Streamer flush begin: eh(%v)", eh)
+		err = eh.flush()
+		if err != nil {
+			log.LogErrorf("Streamer flush failed: eh(%v)", eh)
+			return
+		}
+		eh.stream.dirtylist.Remove(element)
+		if eh.getStatus() == ExtentStatusOpen {
+			s.dirty = false
+			log.LogDebugf("Streamer flush handler open: eh(%v)", eh)
+		} else {
+			// TODO unhandled error
+			eh.cleanup()
+			log.LogDebugf("Streamer flush handler cleaned up: eh(%v)", eh)
+		}
+		// During LTP testing, consecutive write requests may be interspersed with direct I/O operations,
+		// and thus flushSync may flush asynchronous event handles (eh).
+		s.removePendingAsyncFlush(eh.id)
+		log.LogDebugf("Streamer flush end: eh(%v)", eh)
+	}
+	return
+}
+
+func (s *Streamer) flush(wait bool, id string) (err error) {
+	if s.client.enableAsyncFlush && !s.waitForFlush {
+		return s.flushAsync(wait, id)
+	} else {
+		return s.flushSync()
+	}
 }

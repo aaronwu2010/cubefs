@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	minRequiredTTLSeconds       = 30 * 60 // 30 minute
+	minRequiredTTLSeconds       = 10 * 60 // 10 minute
 	FlashTaskInteractiveTimeout = time.Minute * time.Duration(5)
 	ScanManualInterval          = time.Minute * time.Duration(2)
 	CheckInteractiveInterval    = time.Minute * time.Duration(2)
@@ -50,7 +50,7 @@ func checkManualConfig(flt *proto.FlashManualTask, vol *Vol, fltMgr *flashManual
 	switch flt.Action {
 	case proto.FlashManualWarmupAction:
 		if vol.remoteCacheTTL < minRequiredTTLSeconds && vol.remoteCacheTTL != 0 {
-			return fmt.Errorf("cache ttl %v of vol[%v] is too short and warm up can not work", vol.remoteCacheTTL, vol.Name)
+			return fmt.Errorf("cache ttl [%v]s of vol[%v] less than [%v]s and warm up can not work", vol.remoteCacheTTL, vol.Name, minRequiredTTLSeconds)
 		}
 		if err = isDuplicated(flt, fltMgr); err != nil {
 			return err
@@ -141,7 +141,7 @@ func (fltMgr *flashManualTaskManager) process() {
 				log.LogWarnf("insufficient flash node resources")
 				continue
 			}
-			val, ok := fltMgr.cluster.flashNodeTopo.flashNodeMap.Load(lowLoadNode)
+			val, ok := fltMgr.cluster.flashNodeTopo.GetFlashNode(lowLoadNode)
 			if !ok {
 				log.LogErrorf("process(%v), flashNode.Load, nodeAddr is not available, redo task", lowLoadNode)
 				continue
@@ -156,9 +156,9 @@ func (fltMgr *flashManualTaskManager) process() {
 				continue
 			}
 			_ = fltMgr.SetFlashManualTask(task)
-			node := val.(*FlashNode)
+			node := val
 
-			adminTask := node.createFnScanTask(fltMgr.cluster.masterAddr(), task)
+			adminTask := node.CreateFnScanTask(fltMgr.cluster.masterAddr(), task)
 			node.TaskManager.AddTask(adminTask)
 			ticker.Reset(time.Minute)
 			log.LogInfof("add flashnode manual scan task(%v) to flashnode(%v)", adminTask.ToString(), lowLoadNode)
@@ -177,19 +177,8 @@ func (fltMgr *flashManualTaskManager) getTotalWorkCount() int {
 }
 
 func (fltMgr *flashManualTaskManager) findLowLoadNode() string {
-	var (
-		nodeAddr  string
-		scanNodes []string
-		allNodes  = make(map[string]int)
-	)
-	fltMgr.cluster.flashNodeTopo.flashNodeMap.Range(func(addr, flashNode interface{}) bool {
-		node := flashNode.(*FlashNode)
-		allNodes[node.Addr] = node.TaskCountLimit
-		if node.WorkRole == proto.FlashNodeTaskWorker {
-			scanNodes = append(scanNodes, node.Addr)
-		}
-		return true
-	})
+	var nodeAddr string
+	scanNodes, allNodes := fltMgr.cluster.flashNodeTopo.FindLowLoadNode()
 	if len(scanNodes) == 0 {
 		for addr := range allNodes {
 			scanNodes = append(scanNodes, addr)
@@ -287,7 +276,7 @@ func (fltMgr *flashManualTaskManager) dispatchTaskOp(tid string, opCode string) 
 		return fmt.Errorf("task[%v] has already ended. No further actions can be performed", tid)
 	}
 	task.Unlock()
-	val, ok := fltMgr.cluster.flashNodeTopo.flashNodeMap.Load(task.ManualTaskStatistics.FlashNode)
+	val, ok := fltMgr.cluster.flashNodeTopo.GetFlashNode(task.ManualTaskStatistics.FlashNode)
 	if !ok {
 		return fmt.Errorf("nodeAddr[%v] is not available", task.ManualTaskStatistics.FlashNode)
 	}
@@ -296,15 +285,17 @@ func (fltMgr *flashManualTaskManager) dispatchTaskOp(tid string, opCode string) 
 		Command: opCode,
 	}
 	t := proto.NewAdminTask(proto.OpFlashNodeTaskCommand, task.ManualTaskStatistics.FlashNode, command)
-	node := val.(*FlashNode)
-	_, err := node.TaskManager.syncSendAdminTask(t)
+	node := val
+	_, err := node.TaskManager.SyncSendAdminTask(t)
 	return err
 }
 
 func (fltMgr *flashManualTaskManager) stopInteractiveTask(task *proto.FlashManualTask) error {
 	// send stop signal
 	var err error
+	t := time.Now()
 	task.Status = int(proto.Flash_Task_Failed)
+	task.EndTime = &t
 	if err = fltMgr.cluster.syncAddFlashManualTask(task); err != nil {
 		return err
 	}

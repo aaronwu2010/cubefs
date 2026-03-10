@@ -20,6 +20,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -184,6 +185,8 @@ type ExtentHandler struct {
 	storageClass uint32
 
 	isMigration bool
+
+	flushMu sync.Mutex
 }
 
 // NewExtentHandler returns a new extent handler.
@@ -202,7 +205,7 @@ func NewExtentHandler(stream *Streamer, offset int, storeMode int, size int,
 		size:               size,
 		storeMode:          storeMode,
 		empty:              make(chan struct{}, 1024),
-		request:            make(chan *Packet, 1024),
+		request:            make(chan *Packet, 10240),
 		reply:              make(chan *Packet, 1024),
 		doneSender:         make(chan struct{}),
 		doneReceiver:       make(chan struct{}),
@@ -227,7 +230,6 @@ func (eh *ExtentHandler) String() string {
 
 func (eh *ExtentHandler) write(data []byte, offset, size int, direct bool) (ek *proto.ExtentKey, err error) {
 	var total, write int
-
 	status := eh.getStatus()
 	if status >= ExtentStatusClosed {
 		err = errors.NewErrorf("ExtentHandler Write: Full or Recover eh(%v) key(%v)", eh, eh.key)
@@ -256,7 +258,8 @@ func (eh *ExtentHandler) write(data []byte, offset, size int, direct bool) (ek *
 	for total < size {
 		if eh.packet == nil {
 			eh.packet = NewWritePacket(eh.inode, offset+total, eh.storeMode)
-			log.LogDebugf("ExtentHandler write packet nil and new packet: eh(%v)", eh)
+			log.LogDebugf("ExtentHandler write packet nil and new packet: eh(%v) offset(%v)",
+				eh, eh.packet.KernelOffset)
 			if direct {
 				eh.packet.Opcode = proto.OpSyncWrite
 			}
@@ -288,7 +291,8 @@ func (eh *ExtentHandler) write(data []byte, offset, size int, direct bool) (ek *
 
 func (eh *ExtentHandler) sender() {
 	var err error
-
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
 	for {
 		select {
 		case packet := <-eh.request:
@@ -353,6 +357,8 @@ func (eh *ExtentHandler) sender() {
 			eh.setClosed()
 			log.LogDebugf("sender: done, eh(%v) size(%v) ek(%v)", eh, eh.size, eh.key)
 			return
+		case <-ticker.C:
+			log.LogWarnf("eh(%v) sender is still working", eh)
 		}
 	}
 }
@@ -375,6 +381,7 @@ func (eh *ExtentHandler) processReply(packet *Packet) {
 		log.LogDebugf("processReply end: packet(%v), eh(%v)", packet, eh)
 		if atomic.AddInt32(&eh.inflight, -1) <= 0 {
 			eh.empty <- struct{}{}
+			log.LogDebugf("processReply trigger empty: packet(%v), eh(%v)", packet, eh)
 		}
 	}()
 
@@ -503,7 +510,9 @@ func (eh *ExtentHandler) processReplyError(packet *Packet, errmsg string) {
 }
 
 func (eh *ExtentHandler) flush() (err error) {
-	log.LogDebugf("ExtentHandler flush begin: eh(%s)", eh.String())
+	if log.EnableDebug() {
+		log.LogDebugf("ExtentHandler flush begin: eh(%s) trace(%v)", eh.String(), string(debug.Stack()))
+	}
 	eh.flushPacket()
 	err = eh.waitForFlush()
 	if err != nil {
@@ -537,7 +546,13 @@ func (eh *ExtentHandler) cleanup() (err error) {
 			eh.conn = nil
 			// TODO unhandled error
 			status := eh.getStatus()
-			StreamWriteConnPool.PutConnect(conn, status >= ExtentStatusRecovery)
+			forceClose := status >= ExtentStatusRecovery
+			// If storeMode is TinyExtentType, the status is set to Recovery after successful writing.
+			// In this case, the connection should be put back to the pool instead of being closed.
+			if eh.storeMode == proto.TinyExtentType && status == ExtentStatusRecovery && eh.key != nil {
+				forceClose = false
+			}
+			StreamWriteConnPool.PutConnect(conn, forceClose)
 		}
 		close(eh.stop)
 	})
@@ -655,7 +670,8 @@ func (eh *ExtentHandler) waitForFlush() (err error) {
 	if atomic.LoadInt32(&eh.inflight) <= 0 {
 		return
 	}
-
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-eh.empty:
@@ -667,6 +683,10 @@ func (eh *ExtentHandler) waitForFlush() (err error) {
 				return
 			}
 			return fmt.Errorf("eh maybe cleaned")
+		case <-ticker.C: // eh.empty may be empty
+			if atomic.LoadInt32(&eh.inflight) <= 0 {
+				return
+			}
 		}
 	}
 }
@@ -838,6 +858,9 @@ func (eh *ExtentHandler) createExtent(dp *wrapper.DataPartition) (extID int, err
 
 // Handler lock is held by the caller.
 func (eh *ExtentHandler) flushPacket() {
+	eh.flushMu.Lock()
+	defer eh.flushMu.Unlock()
+
 	if eh.packet == nil {
 		log.LogDebugf("ExtentHandler flushPacket nil, return: eh(%v)", eh)
 		return

@@ -22,6 +22,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -37,6 +38,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+
+	//"runtime/debug"
 	runtimepprof "runtime/pprof"
 	"strings"
 	"syscall"
@@ -90,12 +93,15 @@ const (
 	LoggerOutput = "output.log"
 	ModuleName   = "fuseclient"
 
-	ControlCommandSetRate      = "/rate/set"
-	ControlCommandGetRate      = "/rate/get"
-	ControlCommandFreeOSMemory = "/debug/freeosmemory"
-	ControlCommandSuspend      = "/suspend"
-	ControlCommandResume       = "/resume"
-	Role                       = "Client"
+	ControlCommandSetRate            = "/rate/set"
+	ControlCommandGetRate            = "/rate/get"
+	ControlCommandFreeOSMemory       = "/freeosmemory"
+	ControlCommandMemStats           = "/memstats"
+	ControlCommandSuspend            = "/suspend"
+	ControlCommandResume             = "/resume"
+	ControlCommandStopWarmMeta       = "/stopWarmMeta"
+	ControlCommandGetWarmUpMetaPaths = "/warmUpMetaPaths"
+	Role                             = "Client"
 
 	DefaultIP            = "127.0.0.1"
 	DynamicUDSNameFormat = "/tmp/CubeFS-fdstore-%v.sock"
@@ -399,6 +405,14 @@ func main() {
 		stream.SetReqChansize(int(opt.ReqChanCnt))
 	}
 
+	if opt.TcpAliveTime > 0 {
+		stream.StreamConnPool.SetPoolArgs(int64(opt.TcpAliveTime), 0)
+		stream.AheadReadConnPool.SetPoolArgs(int64(opt.TcpAliveTime), 0)
+		stream.AheadReadConnPool.SetUseCostPool(true)
+		stream.StreamWriteConnPool.SetPoolArgs(int64(opt.TcpAliveTime), 0)
+		fmt.Printf("set TcpAliveTime %v\n", opt.TcpAliveTime)
+	}
+
 	level := parseLogLevel(opt.Loglvl)
 	_, err = log.InitLog(opt.Logpath, opt.Volname, level, nil, log.DefaultLogLeftSpaceLimitRatio)
 	if err != nil {
@@ -539,7 +553,8 @@ func main() {
 
 	syslog.Printf("enable bcache %v", opt.EnableBcache)
 	syslog.Printf("bcache only for not ssd %v", opt.BcacheOnlyForNotSSD)
-
+	syslog.Printf("InodeLruLimit %v MinimumNlinkReadDir %v MetaCacheAcceleration %v",
+		opt.InodeLruLimit, opt.MinimumNlinkReadDir, opt.MetaCacheAcceleration)
 	if cfg.GetString(exporter.ConfigKeyPushAddr) == "" {
 		pushAddr, err := getPushAddrFromMaster(opt.Master)
 		if err == nil && pushAddr != "" {
@@ -756,9 +771,12 @@ func mount(opt *proto.MountOptions) (fsConn *fuse.Conn, super *cfs.Super, err er
 	http.HandleFunc(ControlCommandGetRate, super.GetRate)
 	http.HandleFunc(log.SetLogLevelPath, log.SetLogLevel)
 	http.HandleFunc(ControlCommandFreeOSMemory, freeOSMemory)
+	http.HandleFunc(ControlCommandMemStats, memStats)
 	http.HandleFunc(log.GetLogPath, log.GetLog)
 	http.HandleFunc(ControlCommandSuspend, super.SetSuspend)
 	http.HandleFunc(ControlCommandResume, super.SetResume)
+	http.HandleFunc(ControlCommandStopWarmMeta, super.SetStopWarmMeta)
+	http.HandleFunc(ControlCommandGetWarmUpMetaPaths, super.GetWarmUpMetaPaths)
 	// auditlog
 	http.HandleFunc(auditlog.EnableAuditLogReqPath, super.EnableAuditLog)
 	http.HandleFunc(auditlog.DisableAuditLogReqPath, auditlog.DisableAuditLog)
@@ -1001,11 +1019,13 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.EnableAudit = GlobalMountOptions[proto.EnableAudit].GetBool()
 	opt.RequestTimeout = GlobalMountOptions[proto.RequestTimeout].GetInt64()
 	opt.ClientOpTimeOut = GlobalMountOptions[proto.ClientOpTimeOut].GetInt64()
+	opt.TcpAliveTime = GlobalMountOptions[proto.TcpAliveTime].GetInt64()
 	opt.FileSystemName = GlobalMountOptions[proto.FileSystemName].GetString()
 	opt.DisableMountSubtype = GlobalMountOptions[proto.DisableMountSubtype].GetBool()
 	opt.StreamRetryTimeout = int(GlobalMountOptions[proto.StreamRetryTimeOut].GetInt64())
 	opt.ForceRemoteCache = GlobalMountOptions[proto.ForceRemoteCache].GetBool()
 	opt.AheadReadEnable = GlobalMountOptions[proto.AheadReadEnable].GetBool()
+	opt.EnableAsyncFlush = GlobalMountOptions[proto.EnableAsyncFlush].GetBool()
 	if opt.AheadReadEnable {
 		var (
 			total     uint64
@@ -1022,8 +1042,19 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 		available = int64((total - used) / 3)
 		if available < opt.AheadReadTotalMem {
 			opt.AheadReadTotalMem = available
+			fmt.Printf("available ahead read mem: %v\n", available)
 		}
 	}
+	// minimum file size (bytes) to trigger ahead read
+	opt.MinReadAheadSize = GlobalMountOptions[proto.MinReadAheadSize].GetInt64()
+	opt.ReadDirLimit = GlobalMountOptions[proto.ReadDirLimit].GetInt64()
+	opt.MaxWarmUpConcurrency = GlobalMountOptions[proto.MaxWarmUpConcurrency].GetInt64()
+	opt.StopWarmMeta = GlobalMountOptions[proto.StopWarmMeta].GetBool()
+	opt.MetaCacheAcceleration = GlobalMountOptions[proto.MetaCacheAcceleration].GetBool()
+	opt.MinimumNlinkReadDir = GlobalMountOptions[proto.MinimumNlinkReadDir].GetInt64()
+	opt.InodeLruLimit = GlobalMountOptions[proto.InodeLruLimit].GetInt64()
+	opt.FuseServeThreads = GlobalMountOptions[proto.FuseServeThreads].GetInt64()
+
 	if opt.MountPoint == "" || opt.Volname == "" || opt.Owner == "" || opt.Master == "" {
 		return nil, errors.New(fmt.Sprintf("invalid config file: lack of mandatory fields, mountPoint(%v), volName(%v), owner(%v), masterAddr(%v)", opt.MountPoint, opt.Volname, opt.Owner, opt.Master))
 	}
@@ -1112,6 +1143,19 @@ func changeRlimit(val uint64) {
 
 func freeOSMemory(w http.ResponseWriter, r *http.Request) {
 	debug.FreeOSMemory()
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("freeOSMemory is called"))
+}
+
+func memStats(w http.ResponseWriter, r *http.Request) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(m)
 }
 
 func loadConfFromMaster(opt *proto.MountOptions) (err error) {

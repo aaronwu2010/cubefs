@@ -27,10 +27,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/stat"
 )
 
 // Low-level API, i.e. work with inode
@@ -60,6 +62,8 @@ const (
 	InodeFullMaxRetryTime       = 2
 	ForceUpdateRWMP             = "ForceUpdateRWMP"
 )
+
+var GetExtetnsPool = taskpool.New(50, 100)
 
 func (mw *MetaWrapper) GetRootIno(subdir string) (uint64, error) {
 	rootIno, err := mw.LookupPath(subdir)
@@ -388,6 +392,57 @@ func (mw *MetaWrapper) BatchGetExpiredMultipart(prefix string, days int) (expire
 	return
 }
 
+func (mw *MetaWrapper) InodeGetExt_ll(inode uint64) (*proto.InodeInfo, error) {
+	start := time.Now()
+	defer func() {
+		log.LogDebugf("InodeGetExt_ll: time cost (%v), ino(%v)", time.Since(start), inode)
+	}()
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	var info *proto.InodeInfo
+	var getErr error
+
+	go func() {
+		defer wg.Done()
+		info, getErr = mw.InodeGet_ll(inode)
+		if getErr != nil {
+			log.LogErrorf("InodeGetExt_ll: get inode fail: ino(%v) err(%v)", inode, getErr)
+			return
+		}
+	}()
+
+	var resp *proto.GetExtentsResponse
+	var getExtErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		mp := mw.getPartitionByInode(inode)
+		if mp == nil {
+			return
+		}
+
+		resp, getExtErr = mw.getExtents(mp, inode, false, false, false)
+		if getExtErr != nil {
+			log.LogErrorf("InodeGetExt_ll: get extents fail: ino(%v) err(%v)", inode, getExtErr)
+			return
+		}
+	}()
+
+	wg.Wait()
+
+	if getErr != nil {
+		return nil, getErr
+	}
+
+	if info != nil && getExtErr == nil {
+		info.Extents = resp
+	}
+
+	return info, nil
+}
+
 func (mw *MetaWrapper) InodeGet_ll(inode uint64) (*proto.InodeInfo, error) {
 	mp := mw.getPartitionByInode(inode)
 	if mp == nil {
@@ -432,6 +487,44 @@ func (mw *MetaWrapper) doInodeGet(inode uint64) (*proto.InodeInfo, error) {
 	}
 	log.LogDebugf("doInodeGet: info(%v)", info)
 	return info, nil
+}
+
+func (mw *MetaWrapper) BatchInodeGetExtents(inodes []uint64) []*proto.InodeInfo {
+	begin := stat.BeginStat()
+	defer stat.EndStat("BatchInodeGetExtents", nil, begin, 1)
+
+	infos := mw.BatchInodeGet(inodes)
+
+	wg := sync.WaitGroup{}
+	for _, info := range infos {
+
+		if !proto.IsRegular(info.Mode) {
+			continue
+		}
+
+		tmpInfo := info
+
+		wg.Add(1)
+		GetExtetnsPool.Run(func() {
+			defer wg.Done()
+
+			mp := mw.getPartitionByInode(tmpInfo.Inode)
+			if mp == nil {
+				log.LogErrorf("BatchInodeGetExtents: no partition: ino(%v)", tmpInfo.Inode)
+				return
+			}
+
+			resp, err := mw.getExtents(mp, tmpInfo.Inode, false, false, false)
+			if err != nil {
+				log.LogErrorf("BatchInodeGetExtents: get extents fail: ino(%v) err(%v)", tmpInfo.Inode, err)
+				return
+			}
+			tmpInfo.Extents = resp
+		})
+	}
+
+	wg.Wait()
+	return infos
 }
 
 func (mw *MetaWrapper) BatchInodeGet(inodes []uint64) []*proto.InodeInfo {
@@ -1084,10 +1177,15 @@ func (mw *MetaWrapper) txRename_ll(srcParentID uint64, srcName string, dstParent
 	funcs := make([]func() (int, error), 0)
 
 	status, dstInode, dstMode, err := mw.lookup(dstParentMP, dstParentID, dstName, mw.LastVerSeq)
-	if err == nil && status == statusOK {
+	// Only regular files and symlinks are allowed to be overwritten.
+	if err == nil && status == statusOK && overwritten {
+		if !(proto.IsSymlink(dstMode) || proto.IsRegular(dstMode)) {
+			log.LogWarnf("txRename_ll: dst mode is not regular or symlink, mode(%v)", dstMode)
+			return syscall.EEXIST
+		}
 
-		// Note that only regular files are allowed to be overwritten.
-		if !proto.IsRegular(dstMode) || !overwritten || !proto.IsRegular(srcMode) {
+		if !(proto.IsSymlink(srcMode) || proto.IsRegular(srcMode)) {
+			log.LogWarnf("txRename_ll: src mode is not regular or symlink, mode(%v)", srcMode)
 			return syscall.EEXIST
 		}
 

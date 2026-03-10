@@ -22,6 +22,7 @@ import (
 
 	"github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	cfsProto "github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/remotecache/flashgroupmanager"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -78,6 +79,7 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		m.cluster.checkDataNodeHeartbeat()
 		m.cluster.checkMetaNodeHeartbeat()
 		m.cluster.checkLcNodeHeartbeat()
+		m.cluster.checkFlashNodeHeartbeat()
 		m.cluster.lcMgr.startLcScanHandleLeaderChange()
 		m.cluster.flashManMgr.startFlashScanHandleLeaderChange()
 		m.cluster.followerReadManager.reSet()
@@ -335,8 +337,9 @@ func (m *Server) clearMetadata() {
 	m.cluster.t = newTopology()
 	// m.cluster.apiLimiter.Clear()
 
-	m.cluster.flashNodeTopo.clear()
-	m.cluster.flashNodeTopo = newFlashNodeTopology()
+	m.cluster.flashNodeTopo.Clear()
+	m.cluster.flashNodeTopo = flashgroupmanager.NewFlashNodeTopology()
+	m.cluster.flashNodeTopo.SyncFlashGroupFunc = m.cluster.syncUpdateFlashGroup
 }
 
 func (m *Server) refreshUser() (err error) {

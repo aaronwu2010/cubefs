@@ -187,6 +187,13 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 
 	fillAttr(info, a)
 	a.ParentIno = f.parentIno
+
+	// var fileSize int64
+	// var gen uint64
+	// if info.Extents != nil {
+	// 	a.Size = uint64(info.Extents.Size)
+	// }
+
 	fileSize, gen := f.fileSizeVersion2(ino)
 	log.LogDebugf("Attr: ino(%v) fileSize(%v) gen(%v) inode.gen(%v)", ino, fileSize, gen, info.Generation)
 	if gen >= info.Generation {
@@ -248,12 +255,16 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	}()
 
 	ino := f.info.Inode
-	log.LogDebugf("TRACE open ino(%v) info(%v) fullPath(%v)", ino, f.info, path.Join(f.getParentPath(), f.name))
+	if log.EnableDebug() {
+		log.LogDebugf("TRACE open ino(%v) info(%v) fullPath(%v)", ino, f.info, path.Join(f.getParentPath(), f.name))
+	}
 	start := time.Now()
 
 	if f.super.bcacheDir != "" && !f.filterFilesSuffix(f.super.bcacheFilterFiles) {
 		parentPath := f.getParentPath()
-		log.LogDebugf("TRACE open ino(%v) fullpath(%v)", ino, path.Join(f.getParentPath(), f.name))
+		if log.EnableDebug() {
+			log.LogDebugf("TRACE open ino(%v) fullpath(%v)", ino, path.Join(f.getParentPath(), f.name))
+		}
 		if parentPath != "" && !strings.HasSuffix(parentPath, "/") {
 			parentPath = parentPath + "/"
 		}
@@ -277,7 +288,16 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	}
 	log.LogDebugf("TRACE open ino(%v) f.super.bcacheDir(%v) needBCache(%v)", ino, f.super.bcacheDir, needBCache)
 
-	f.super.ec.RefreshExtentsCache(ino)
+	if f.super.metaCacheAcceleration {
+		inodeInfo, err1 := f.super.InodeGet(ino)
+		if err1 == nil && inodeInfo != nil && inodeInfo.Extents != nil {
+			f.super.ec.RefreshExtentsWithCache(inodeInfo)
+		} else {
+			f.super.ec.RefreshExtentsCache(ino)
+		}
+	} else {
+		f.super.ec.RefreshExtentsCache(ino)
+	}
 
 	if f.super.keepCache && resp != nil {
 		resp.Flags |= fuse.OpenKeepCache
@@ -336,7 +356,7 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 		stat.EndStat("Release:file", err, bgTime, 1)
 		log.LogInfof("action[Release] %v", f.fWriter)
 		f.fWriter.FreeCache()
-		if f.super.ec.RefCnt(ino) == 0 {
+		if f.super.ec.RefCnt(ino) == 0 && !f.super.metaCacheAcceleration {
 			// keep nodeCache hold the latest inode info
 			f.super.fslock.Lock()
 			delete(f.super.nodeCache, ino)
@@ -351,15 +371,16 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 				parent, ok := node.(*Dir)
 				if ok {
 					parent.dcache.Delete(f.name)
-					log.LogDebugf("TRACE Release exit: ino(%v) name(%v) decache(%v)",
-						parent.info.Inode, parent.name, parent.dcache.Len())
+					if log.EnableDebug() {
+						log.LogDebugf("TRACE Release exit: ino(%v) name(%v) decache(%v)",
+							parent.info.Inode, parent.name, parent.dcache.Len())
+					}
 				}
 			}
 			f.super.fslock.Unlock()
 		}
 		f.super.runningMonitor.SubClientOp(runningStat, err)
 	}()
-
 	log.LogDebugf("TRACE Release enter: ino(%v) req(%v)", ino, req)
 
 	start := time.Now()
@@ -374,8 +395,10 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 		log.LogErrorf("Release: close writer failed, ino(%v) req(%v) err(%v)", ino, req, err)
 		return ParseError(err)
 	}
-	elapsed := time.Since(start)
-	log.LogDebugf("TRACE Release: ino(%v) req(%v) name(%v)(%v)ns", ino, req, path.Join(f.getParentPath(), f.name), elapsed.Nanoseconds())
+	if log.EnableDebug() {
+		elapsed := time.Since(start)
+		log.LogDebugf("TRACE FileRelease: ino(%v) req(%v) name(%v)(%v)ns", ino, req, path.Join(f.getParentPath(), f.name), elapsed.Nanoseconds())
+	}
 
 	return nil
 }
@@ -404,7 +427,6 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		stat.StatBandWidth("Read", uint32(req.Size))
 		f.super.runningMonitor.SubClientOp(runningStat, err)
 	}()
-
 	log.LogDebugf("TRACE Read enter: ino(%v) storageClass(%v) offset(%v) filesize(%v) reqsize(%v) req(%v)",
 		f.info.Inode, f.info.StorageClass, req.Offset, f.info.Size, req.Size, req)
 
@@ -540,7 +562,8 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	var size int
 	if f.shouldAccessReplicaStorageClass() {
 		f.super.ec.GetStreamer(ino).SetParentInode(f.parentIno)
-		if size, err = f.super.ec.Write(ino, int(req.Offset), req.Data, flags, checkFunc, f.info.StorageClass, false); err == ParseError(syscall.ENOSPC) {
+		if size, err = f.super.ec.Write(ino, int(req.Offset), req.Data, flags, checkFunc, f.info.StorageClass,
+			false, waitForFlush); err == ParseError(syscall.ENOSPC) {
 			return
 		}
 	} else {
@@ -583,8 +606,8 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		}
 	}
 	elapsed := time.Since(start)
-	log.LogDebugf("TRACE Write: ino(%v) offset(%v) len(%v) flags(%v) fileflags(%v) req(%v) (%v)ns ",
-		ino, req.Offset, reqlen, req.Flags, req.FileFlags, req, elapsed.Nanoseconds())
+	log.LogDebugf("TRACE Write: ino(%v) offset(%v) len(%v) flags(%v) fileflags(%v) req(%v) (%v) ",
+		ino, req.Offset, reqlen, req.Flags, req.FileFlags, req, elapsed.String())
 	return nil
 }
 
@@ -631,7 +654,15 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
 	}
 
 	if DisableMetaCache {
-		f.super.ic.Delete(f.info.Inode)
+		openForWrite := false
+		if req.Flags&0x0f != syscall.O_RDONLY {
+			openForWrite = true
+		}
+
+		if openForWrite {
+			f.super.ic.Delete(f.info.Inode)
+		}
+
 	}
 
 	elapsed := time.Since(start)
@@ -761,7 +792,9 @@ func (f *File) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string,
 		log.LogErrorf("Readlink: ino(%v) err(%v)", ino, err)
 		return "", ParseError(err)
 	}
-	log.LogDebugf("TRACE Readlink: ino(%v) target(%v)", ino, string(info.Target))
+	if log.EnableDebug() {
+		log.LogDebugf("TRACE Readlink: ino(%v) target(%v)", ino, string(info.Target))
+	}
 	return string(info.Target), nil
 }
 
@@ -782,6 +815,15 @@ func (f *File) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fu
 	name := req.Name
 	size := req.Size
 	pos := req.Position
+
+	// Optimize: directly return empty value for security.capability to avoid frequent server queries
+	// This avoids backend service access for system xattr that is frequently queried during write operations
+	if name == "security.capability" {
+		resp.Xattr = []byte{}
+		log.LogDebugf("TRACE GetXattr: ino(%v) name(%v) (optimized, returning empty)", ino, name)
+		return nil
+	}
+
 	info, err := f.super.mw.XAttrGet_ll(ino, name)
 	if err != nil {
 		log.LogErrorf("GetXattr: ino(%v) name(%v) err(%v)", ino, name, err)

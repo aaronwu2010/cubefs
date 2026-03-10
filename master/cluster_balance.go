@@ -1797,3 +1797,168 @@ func (c *Cluster) CalculateMetaPartitionFreezeCount(name string) (*CleanTask, er
 
 	return ret, nil
 }
+
+func (c *Cluster) getUnderLoadNodeSet(BalanceType uint32, dp *DataPartition, zone string, excludedNodeSet uint64, numCopies int) (nodeset *nodeSet, err error) {
+	switch BalanceType {
+	case BalanceByDPCount:
+		return c.getUnderLoadNodeSetByDPCount(dp, zone, excludedNodeSet, numCopies)
+	case BalanceByDiskUsage:
+		return c.getUnderLoadNodeSetByDiskUsage(dp, zone, excludedNodeSet, numCopies)
+	default:
+		panic("getUnderLoadNodeSet parameter failure: only accepts BalanceByDPCount or BalanceByDiskUsage")
+	}
+}
+
+func (c *Cluster) getUnderLoadNodesInNodeSet(BalanceType uint32, dp *DataPartition, nodeset uint64) (underloadDataNodes []*DataNode, err error) {
+	switch BalanceType {
+	case BalanceByDPCount:
+		return c.getUnderLoadNodesInNodeSetByDPCount(dp, nodeset)
+	case BalanceByDiskUsage:
+		return c.getUnderLoadNodesInNodeSetByDiskUsage(dp, nodeset)
+	default:
+		panic("getUnderLoadNodesInNodeSet parameter failure: only accepts BalanceByDPCount or BalanceByDiskUsage")
+	}
+}
+
+func (c *Cluster) isOverloadDataNode(BalanceType uint32, dataNode *DataNode) bool {
+	switch BalanceType {
+	case BalanceByDPCount:
+		return dataNode.DataPartitionCount < c.cfg.DataNodeBalanceByDPCountHigh
+	case BalanceByDiskUsage:
+		return dataNode.UsageRatio < c.cfg.DataNodeBalanceByDiskUsageHigh
+	default:
+		panic("isOverloadDataNode parameter failure: only accepts BalanceByDPCount or BalanceByDiskUsage")
+	}
+}
+
+// for inter-nodeset balancing:
+// given a datapartition, get a node set different than the excludedNodeSet
+// the selection critieria is
+// the target nodeset has at least numCopies underload dataNodes, and these underload datanodes do not hold the replica of dp
+func (c *Cluster) getUnderLoadNodeSetByDiskUsage(dp *DataPartition, zone string, excludedNodeSet uint64, numCopies int) (nodeset *nodeSet, err error) {
+	var z *Zone
+
+	z, err = c.t.getZone(zone)
+	if err != nil {
+		return nil, fmt.Errorf("getUnderLoadNodeSetByDiskUsage: %v", err.Error())
+	}
+
+	for _, ns := range z.nodeSetMap {
+		if ns.ID == excludedNodeSet {
+			continue
+		}
+		n := 0
+		ns.dataNodes.Range(func(key, value any) bool {
+			dataNode := value.(*DataNode)
+			if !dp.hasHost(dataNode.Addr) && dataNode.UsageRatio <= c.cfg.DataNodeBalanceByDiskUsageLow {
+				n++
+			}
+			return true
+		})
+		if n >= numCopies {
+			return ns, nil
+		}
+	}
+
+	return nil, fmt.Errorf("getUnderLoadNodeSetByDiskUsage: failed to find a qualified nodeset!")
+}
+
+// get underloadDataNodes within given nodeset that do not hold replica of dp
+func (c *Cluster) getUnderLoadNodesInNodeSetByDiskUsage(dp *DataPartition, nodeset uint64) (underloadDataNodes []*DataNode, err error) {
+	var ns *nodeSet
+
+	if ns, err = c.t.getNodeSetByNodeSetId(nodeset); err != nil {
+		return nil, fmt.Errorf("getUnderLoadNodesInNodeSetByDiskUsage: failed to find nodeset %v", nodeset)
+	}
+
+	ns.dataNodes.Range(func(addr, node interface{}) bool {
+		dataNode := node.(*DataNode)
+		if dataNode.isActive && !dp.hasHost(dataNode.Addr) && dataNode.UsageRatio <= c.cfg.DataNodeBalanceByDiskUsageLow {
+			underloadDataNodes = append(underloadDataNodes, dataNode)
+		}
+		return true
+	})
+
+	return underloadDataNodes, nil
+}
+
+func (c *Cluster) getUnderLoadNodeSetByDPCount(dp *DataPartition, zone string, excludedNodeSet uint64, numCopies int) (nodeset *nodeSet, err error) {
+	var z *Zone
+
+	z, err = c.t.getZone(zone)
+	if err != nil {
+		return nil, fmt.Errorf("getUnderLoadNodeSetByDPCount: %v", err.Error())
+	}
+
+	for _, ns := range z.nodeSetMap {
+		if ns.ID == excludedNodeSet {
+			continue
+		}
+		n := 0
+		ns.dataNodes.Range(func(key, value any) bool {
+			dataNode := value.(*DataNode)
+			if !dp.hasHost(dataNode.Addr) && dataNode.DataPartitionCount <= c.cfg.DataNodeBalanceByDPCountLow {
+				n++
+			}
+			return true
+		})
+		if n >= numCopies {
+			return ns, nil
+		}
+	}
+
+	return nil, fmt.Errorf("getUnderLoadNodeSetByDPCount: failed to find a qualified nodeset!")
+}
+
+func (c *Cluster) getUnderLoadNodesInNodeSetByDPCount(dp *DataPartition, nodeset uint64) (underloadDataNodes []*DataNode, err error) {
+	var ns *nodeSet
+
+	if ns, err = c.t.getNodeSetByNodeSetId(nodeset); err != nil {
+		return nil, fmt.Errorf("getUnderLoadNodesInNodeSetByDPCount failed: %v", err)
+	}
+
+	ns.dataNodes.Range(func(addr, node interface{}) bool {
+		dataNode := node.(*DataNode)
+		if dataNode.isActive && !dp.hasHost(dataNode.Addr) && dataNode.DataPartitionCount <= c.cfg.DataNodeBalanceByDPCountLow {
+			underloadDataNodes = append(underloadDataNodes, dataNode)
+		}
+		return true
+	})
+
+	return underloadDataNodes, nil
+}
+
+// after releasing the token when decommission balancing is successful
+// this function does:
+// 1. add monitor metrics
+// 2. check if there is more replica in SrcNodeSet, mark another replica to decommission
+func (c *Cluster) postBalanceDecommissionSucccess(BalanceType uint32, dp *DataPartition, datanode *DataNode, dstNodeSet uint64) {
+	if dstNodeSet != 0 {
+		datanode.BalancedDiskUsage += dp.used
+		datanode.BalancedDPCount += 1
+		c.syncUpdateDataNode(datanode)
+
+		hosts := c.getReplicaHostsInNodeSet(dp, datanode.NodeSetID)
+		if len(hosts) != 0 {
+			log.LogInfof("action[postBalanceDecommissionSucccess], clusterID[%v], node[%v], dp[%v] still has replica in the nodeset [%v]",
+				c.Name, datanode.ID, dp.PartitionID, datanode.NodeSetID)
+			triggerCondition := fmt.Sprintf(" postBalanceDecommission_dp(%v)", dp.PartitionID)
+			if err := c.markDecommissionDataPartition(dp, hosts[0], dstNodeSet, false, BalanceByDiskUsage, lowPriorityDecommissionWeight, triggerCondition); err != nil {
+				log.LogWarnf("action[postBalanceDecommissionSucccess], clusterID[%v], node[%v] failed to mark decommission data partition[%v], error[%v]",
+					c.Name, datanode.ID, dp.PartitionID, err)
+			}
+		}
+	}
+}
+
+func (c *Cluster) getReplicaHostsInNodeSet(dp *DataPartition, nodeset uint64) []*DataNode {
+	var hosts []*DataNode
+
+	for _, replica := range dp.Replicas {
+		if replica.dataNode.NodeSetID == nodeset {
+			hosts = append(hosts, replica.dataNode)
+		}
+	}
+
+	return hosts
+}

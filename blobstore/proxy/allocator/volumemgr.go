@@ -324,6 +324,9 @@ func (v *volumeMgr) initModeInfo(ctx context.Context) (err error) {
 	if err != nil {
 		return errors.Base(err, "strconv.Atoi volumeChunkSize err").Detail(err)
 	}
+	if err = clustermgr.LoadExtendCodemode(ctx, v.clusterMgr); err != nil {
+		return errors.Base(err, "Get code_mode_extend config")
+	}
 	codeModeInfos, err := v.clusterMgr.GetConfig(ctx, proto.CodeModeConfigKey)
 	if err != nil {
 		return errors.Base(err, "Get code_mode config from clusterMgr err").Detail(err)
@@ -334,11 +337,12 @@ func (v *volumeMgr) initModeInfo(ctx context.Context) (err error) {
 		return errors.Base(err, "json.Unmarshal code_mode policy err").Detail(err)
 	}
 	for _, codeModeConfig := range codeModeConfigInfos {
-		allocCh := make(chan *allocArgs)
-		codeMode := codeModeConfig.ModeName.GetCodeMode()
 		if !codeModeConfig.Enable {
 			continue
 		}
+
+		allocCh := make(chan *allocArgs)
+		codeMode := codeModeConfig.ModeName.GetCodeMode()
 
 		v.allocChs[codeMode] = allocCh
 		tactic := codeMode.Tactic()

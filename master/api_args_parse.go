@@ -1586,6 +1586,17 @@ func parseAndExtractSetNodeInfoParams(r *http.Request) (params map[string]interf
 		params[flashNodeHandleReadTimeout] = val
 	}
 
+	if value = r.FormValue(flashHotKeyMissCount); value != "" {
+		noParams = false
+		val := int64(0)
+		val, err = strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			err = unmatchedKey(flashHotKeyMissCount)
+			return
+		}
+		params[flashHotKeyMissCount] = val
+	}
+
 	if value = r.FormValue(flashNodeReadDataNodeTimeout); value != "" {
 		noParams = false
 		val := int64(0)
@@ -1705,6 +1716,50 @@ func parseAndExtractSetNodeInfoParams(r *http.Request) (params map[string]interf
 			return
 		}
 		params[forbidWriteOpOfProtoVersion0] = val
+	}
+
+	if value = r.FormValue(flashReadFlowLimit); value != "" {
+		noParams = false
+		val := int64(0)
+		val, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			err = unmatchedKey(flashReadFlowLimit)
+			return
+		}
+		params[flashReadFlowLimit] = val
+	}
+
+	if value = r.FormValue(flashWriteFlowLimit); value != "" {
+		noParams = false
+		val := int64(0)
+		val, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			err = unmatchedKey(flashWriteFlowLimit)
+			return
+		}
+		params[flashWriteFlowLimit] = val
+	}
+
+	if value = r.FormValue(flashKeyFlowLimit); value != "" {
+		noParams = false
+		val := int64(0)
+		val, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			err = unmatchedKey(flashKeyFlowLimit)
+			return
+		}
+		params[flashKeyFlowLimit] = val
+	}
+
+	if value = r.FormValue(remoteClientFlowLimit); value != "" {
+		noParams = false
+		val := int64(0)
+		val, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			err = unmatchedKey(remoteClientFlowLimit)
+			return
+		}
+		params[remoteClientFlowLimit] = val
 	}
 
 	if noParams {
@@ -2152,6 +2207,9 @@ func parseSetConfigParam(r *http.Request) (config map[string]string, err error) 
 		cfgAutoMpMigrate,
 		flashNodeHandleReadTimeout,
 		flashNodeReadDataNodeTimeout,
+		flashHotKeyMissCount,
+		flashReadFlowLimit,
+		flashWriteFlowLimit,
 	}
 	for _, val := range keyList {
 		key := val

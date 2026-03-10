@@ -62,6 +62,12 @@ func (api *AdminAPI) GetCluster(volStorageClass bool) (cv *proto.ClusterView, er
 	return
 }
 
+func (api *AdminAPI) GetClusterView() (cv *proto.ClusterView, err error) {
+	cv = &proto.ClusterView{}
+	err = api.mc.requestWith(cv, newRequest(get, proto.AdminGetCluster).Header(api.h))
+	return
+}
+
 func (api *AdminAPI) GetClusterDataNodes() (nodes []proto.NodeView, err error) {
 	nodes = []proto.NodeView{}
 	err = api.mc.requestWith(&nodes, newRequest(get, proto.AdminGetClusterDataNodes).Header(api.h))
@@ -244,6 +250,14 @@ func (api *AdminAPI) AddMetaReplica(metaPartitionID uint64, nodeAddr string, cli
 	request.addParam("addr", nodeAddr)
 	request.addParam("clientIDKey", clientIDKey)
 	_, err = api.mc.serveRequest(request)
+	return
+}
+
+func (api *AdminAPI) QueryDataPartitionDecommissionStatusUpdateRecords(partitionId uint64) (records []*proto.DecommissionStatusRecord, err error) {
+	request := newRequest(get, proto.AdminQueryDataPartitionDecommissionStatusUpdateRecords).Header(api.h)
+	request.addParam("id", strconv.FormatUint(partitionId, 10))
+	records = make([]*proto.DecommissionStatusRecord, 0)
+	err = api.mc.requestWith(&records, request)
 	return
 }
 
@@ -599,6 +613,10 @@ func (api *AdminAPI) SetClusterParas(batchCount, markDeleteRate, deleteWorkerSle
 	dpRepairTimeout string, dpTimeout string, mpTimeout string, dpBackupTimeout string,
 	decommissionDpLimit, decommissionDiskLimit, forbidWriteOpOfProtoVersion0 string, mediaType string,
 	handleTimeout string, readDataNodeTimeout string,
+	remoteCacheTTL string, remoteCacheReadTimeout string,
+	remoteCacheMultiRead string, flashNodeTimeoutCount string,
+	remoteCacheSameZoneTimeout string, remoteCacheSameRegionTimeout string, flashHotKeyMissCount string,
+	flashReadFlowLimit string, flashWriteFlowLimit string, flashKeyFlowLimit string, remoteClientFlowLimit string,
 ) (err error) {
 	request := newRequest(get, proto.AdminSetNodeInfo).Header(api.h)
 	request.addParam("batchCount", batchCount)
@@ -659,7 +677,40 @@ func (api *AdminAPI) SetClusterParas(batchCount, markDeleteRate, deleteWorkerSle
 	if readDataNodeTimeout != "" {
 		request.addParam("flashNodeReadDataNodeTimeout", readDataNodeTimeout)
 	}
-
+	if flashHotKeyMissCount != "" {
+		request.addParam("flashHotKeyMissCount", flashHotKeyMissCount)
+	}
+	// remoteCache config
+	if remoteCacheTTL != "" {
+		request.addParamAny("remoteCacheTTL", remoteCacheTTL)
+	}
+	if remoteCacheReadTimeout != "" {
+		request.addParamAny("remoteCacheReadTimeout", remoteCacheReadTimeout)
+	}
+	if remoteCacheMultiRead != "" {
+		request.addParamAny("remoteCacheMultiRead", remoteCacheMultiRead)
+	}
+	if flashNodeTimeoutCount != "" {
+		request.addParamAny("flashNodeTimeoutCount", flashNodeTimeoutCount)
+	}
+	if remoteCacheSameZoneTimeout != "" {
+		request.addParamAny("remoteCacheSameZoneTimeout", remoteCacheSameZoneTimeout)
+	}
+	if remoteCacheSameRegionTimeout != "" {
+		request.addParamAny("remoteCacheSameRegionTimeout", remoteCacheSameRegionTimeout)
+	}
+	if flashReadFlowLimit != "" {
+		request.addParamAny("flashReadFlowLimit", flashReadFlowLimit)
+	}
+	if flashWriteFlowLimit != "" {
+		request.addParamAny("flashWriteFlowLimit", flashWriteFlowLimit)
+	}
+	if flashKeyFlowLimit != "" {
+		request.addParamAny("flashKeyFlowLimit", flashKeyFlowLimit)
+	}
+	if remoteClientFlowLimit != "" {
+		request.addParamAny("remoteClientFlowLimit", remoteClientFlowLimit)
+	}
 	_, err = api.mc.serveRequest(request)
 	return
 }
@@ -1045,5 +1096,11 @@ func (api *AdminAPI) StopMetaNodeBalanceTask() (result string, err error) {
 
 func (api *AdminAPI) DeleteMetaNodeBalanceTask() (result string, err error) {
 	err = api.mc.requestWith(&result, newRequest(get, proto.DeleteMetaNodeBalanceTask).Header(api.h))
+	return
+}
+
+func (api *AdminAPI) GetRemoteCacheConfig() (config *proto.RemoteCacheConfig, err error) {
+	config = &proto.RemoteCacheConfig{}
+	err = api.mc.requestWith(config, newRequest(get, proto.AdminGetRemoteCacheConfig).Header(api.h))
 	return
 }
